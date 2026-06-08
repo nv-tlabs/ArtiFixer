@@ -16,7 +16,7 @@
 
 [Project Page](https://research.nvidia.com/labs/sil/projects/artifixer/) / [Paper](https://research.nvidia.com/labs/sil/projects/artifixer/assets/paper.pdf)
 
-![Base 3DGRUT vs ArtiFixer3D+ slider](assets/demo/roof_anchor_base_vs_af3dplus_slider.gif)
+![Base 3DGRUT vs ArtiFixer3D+ slider](https://github.com/user-attachments/assets/3d1af206-9818-4482-bb71-b801badffc08)
 
 This repository provides the official implementation of ArtiFixer.
 
