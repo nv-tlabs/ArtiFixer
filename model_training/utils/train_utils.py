@@ -358,7 +358,7 @@ def get_kv_cache_pipe(args: argparse.Namespace, device: torch.device | str) -> A
         vae=vae,
         transformer=WanTransformer3DModel.from_config(
             args.model_id, subfolder="transformer", torch_dtype=torch.bfloat16
-        ),
+        ).to(device),
         tokenizer=None,
         text_encoder=None,
         frames_per_block=args.frames_per_block,
