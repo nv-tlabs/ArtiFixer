@@ -101,6 +101,7 @@ class ArtifixerKvCachePipeline(ArtifixerPipelineBase):
         negative_prompt: str | torch.Tensor | None = None,  # unused — KV-cache pipeline does not do CFG
         num_inference_steps: int = 4,
         text_guidance_scale: float = 5.0,  # unused — KV-cache pipeline does not do CFG
+        *,
         show_progress: bool = False,
         progress_bar_leave: bool = True,
         max_neighbors_per_encode: int | None = None,
@@ -123,9 +124,9 @@ class ArtifixerKvCachePipeline(ArtifixerPipelineBase):
             neighbor_Ks,
             prompt,
             num_inference_steps,
-            show_progress,
-            progress_bar_leave,
-            max_neighbors_per_encode,
+            show_progress=show_progress,
+            progress_bar_leave=progress_bar_leave,
+            max_neighbors_per_encode=max_neighbors_per_encode,
         )
         return self.decode_latents_to_video(latents)
 
@@ -142,6 +143,7 @@ class ArtifixerKvCachePipeline(ArtifixerPipelineBase):
         neighbor_Ks: torch.Tensor | None,
         prompt: str | torch.Tensor,
         num_inference_steps: int = 4,
+        *,
         show_progress: bool = False,
         progress_bar_leave: bool = True,
         max_neighbors_per_encode: int | None = None,
@@ -162,6 +164,11 @@ class ArtifixerKvCachePipeline(ArtifixerPipelineBase):
         else:
             prompt_embeds = self.get_t5_prompt_embeds(prompt).expand(batch_size, -1, -1)
 
+        # Keyword args from use_exit_flag onward: passing show_progress /
+        # progress_bar_leave positionally used to land show_progress on
+        # ignore_neighbors, silently dropping the reference views on any
+        # process with show_progress=True (i.e. rank 0 -- every single-GPU
+        # run). See generate_samples_from_batch's signature.
         return self.generate_samples_from_batch(
             condition,
             rendered_opacity,
@@ -173,9 +180,9 @@ class ArtifixerKvCachePipeline(ArtifixerPipelineBase):
             neighbor_Ks,
             prompt_embeds,
             num_inference_steps,
-            False,
-            show_progress,
-            progress_bar_leave,
+            use_exit_flag=False,
+            show_progress=show_progress,
+            progress_bar_leave=progress_bar_leave,
         )
 
     @torch.no_grad()
@@ -204,6 +211,10 @@ class ArtifixerKvCachePipeline(ArtifixerPipelineBase):
         encoded_prompt: torch.Tensor,
         num_inference_steps: int,
         use_exit_flag: bool,
+        # Keyword-only: trailing boolean flags must not bind positionally (a
+        # positional call once silently swapped show_progress into
+        # ignore_neighbors, dropping the reference views).
+        *,
         ignore_neighbors: bool = False,
         show_progress: bool = False,
         progress_bar_leave: bool = True,
