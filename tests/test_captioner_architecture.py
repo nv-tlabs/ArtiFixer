@@ -59,4 +59,4 @@ def test_captioner_loads_the_checkpoint_architecture(tmp_path, monkeypatch, moe)
     assert type(actual) is cls
     assert actual.state_dict().keys() == expected.state_dict().keys()
     for name, tensor in expected.state_dict().items():
-        torch.testing.assert_close(actual.state_dict()[name], tensor, rtol=0, atol=0)
+        torch.testing.assert_close(actual.state_dict()[name].cpu(), tensor, rtol=0, atol=0)
