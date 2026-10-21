@@ -22,7 +22,7 @@ import uuid
 import zipfile
 from contextlib import ExitStack, contextmanager
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 GATE = REPO_ROOT / "tests/assert_no_ffmpeg_in_image.py"
@@ -158,6 +158,8 @@ def scan_layer(stream, predicates):
         for member in archive:
             count += 1
             name = member.name.rstrip("/").rsplit("/", 1)[-1]
+            if ".git" in PurePosixPath(member.name).parts or name == ".CI_CONFIG_DO_NOT_PUSH_THIS_FILE_TO_PUBLIC.yaml":
+                offenders.append(member.name)
             if (
                 member.isfile()
                 and (
@@ -439,7 +441,7 @@ def scan_saved_archive(archive, metadata, predicates):
     offenders = [f"{path}:{name}" for path in sorted(layers) for name in layers[path]["offenders"]]
     return {
         "status": "fail" if offenders else "pass",
-        "scope": "all saved filesystem layer bytes, including /dev, /proc and /sys; known codec names and wheels",
+        "scope": "all saved filesystem layer bytes, including /dev, /proc and /sys; known codec names, wheels and repository metadata",
         "configuration_digest": config_id,
         "descriptor_chain": list(chain),
         "layers": [layers[path] for path in selected_paths],

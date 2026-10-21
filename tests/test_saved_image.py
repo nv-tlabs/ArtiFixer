@@ -29,13 +29,21 @@ def fixture_archive(
     legacy=False,
     other_platform=False,
     other_codec=False,
+    payload_path=None,
+    payload_type=tarfile.REGTYPE,
 ):
     payload = io.BytesIO()
     with tarfile.open(fileobj=payload, mode="w") as archive:
         data = b"\x7fELFfixture" if masked_codec else b"fixture\n"
-        member = tarfile.TarInfo("dev/libavcodec.so" if masked_codec else "{fixture}")
-        member.size = len(data)
-        archive.addfile(member, io.BytesIO(data))
+        member = tarfile.TarInfo(payload_path or ("dev/libavcodec.so" if masked_codec else "{fixture}"))
+        member.type = payload_type
+        if member.isfile():
+            member.size = len(data)
+            archive.addfile(member, io.BytesIO(data))
+        else:
+            if member.issym() or member.islnk():
+                member.linkname = "git-storage"
+            archive.addfile(member)
     layer = payload.getvalue()
     if encoding == "gzip":
         packed = gzip.compress(layer, mtime=0)
@@ -204,6 +212,31 @@ def test_configuration_manifest_and_index_ids_are_bound_to_layer_bytes(scan, ide
 def test_legacy_classic_archive(scan):
     result, _, config_digest = scan(identity="config", encoding="none", legacy=True)
     assert result["status"] == "pass" and result["configuration_digest"] == config_digest
+
+
+@pytest.mark.parametrize("encoding", ["none", "gzip", "zstd"])
+@pytest.mark.parametrize(
+    "path,kind",
+    [
+        (".git", tarfile.REGTYPE),
+        ("opt/pytorch/pytorch/.git", tarfile.REGTYPE),
+        ("workspace/project/.git", tarfile.DIRTYPE),
+        ("workspace/project/.git", tarfile.SYMTYPE),
+        ("workspace/project/.git", tarfile.LNKTYPE),
+        ("opt/pytorch/pytorch/.git/config", tarfile.REGTYPE),
+        ("opt/pytorch/fuser/.CI_CONFIG_DO_NOT_PUSH_THIS_FILE_TO_PUBLIC.yaml", tarfile.REGTYPE),
+    ],
+)
+def test_repository_metadata_is_rejected_from_distributed_layers(scan, encoding, path, kind):
+    result, _, _ = scan(encoding=encoding, payload_path=path, payload_type=kind)
+    assert result["status"] == "fail"
+    assert any(path in offender for offender in result["offenders"])
+
+
+@pytest.mark.parametrize("path", ["workspace/project/.gitignore", "workspace/project/.gitmodules"])
+def test_git_source_configuration_is_allowed(scan, path):
+    result, _, _ = scan(payload_path=path)
+    assert result["status"] == "pass"
 
 
 @pytest.mark.parametrize(

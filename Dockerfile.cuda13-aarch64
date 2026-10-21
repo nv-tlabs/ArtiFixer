@@ -115,5 +115,10 @@ RUN python -c "from moge.model.v2 import MoGeModel; print('MoGe ok')"
 # Final-filesystem codec check (distribution also requires flattening): the image must contain no ffmpeg codecs. If the NGC
 # base image ships libav/ffmpeg, this fails the build — remove those packages
 # above rather than weakening the check.
+# NGC bases retain Git metadata and an internal CI configuration. Neither is
+# needed at runtime or belongs in the flattened distribution.
+RUN find / -xdev \( -name .git -o -name .CI_CONFIG_DO_NOT_PUSH_THIS_FILE_TO_PUBLIC.yaml \) \
+    -prune -exec rm -rf -- {} +
+
 COPY tests/assert_no_ffmpeg_in_image.py /workspace/assert_no_ffmpeg_in_image.py
 RUN python /workspace/assert_no_ffmpeg_in_image.py --json

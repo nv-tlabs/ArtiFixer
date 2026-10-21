@@ -169,6 +169,11 @@ Docker's runtime mounts at `/dev`, `/proc` and `/sys`. Known codec binaries,
 libraries, wheel members and standard package caches fail that scan. The
 runtime check alone cannot inspect bytes hidden by those mounts.
 
+The saved-layer scan also rejects Git metadata (`.git` files, directories,
+links, and their contents) and the base images' internal
+`.CI_CONFIG_DO_NOT_PUSH_THIS_FILE_TO_PUBLIC.yaml` configuration. The Dockerfiles
+remove these before flattening; runtime package code and license files remain.
+
 The verifier runs as root with a read-only filesystem, no network, no GPU, no
 host bind mounts, and an explicit Python entrypoint. It scans `/`, checks known
 codec filenames and wheel members, package caches, PyAV/DALI/torchaudio
