@@ -556,7 +556,7 @@ def verify(image: str, *, require_flat: bool = True, expected_platform: str | No
         failures.append(f"Expected {expected_platform}, found {platform(metadata)}")
     saved = scan_saved_image(metadata) if require_flat and not failures else None
     if saved and saved["status"] != "pass":
-        failures.append("Saved image payload contains known codec files or package caches")
+        failures.append("Saved image payload contains known codec files, package caches or repository metadata")
     gate_source = GATE.read_bytes()
     name = f"artifixer-verify-{uuid.uuid4().hex}"
     try:

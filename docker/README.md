@@ -170,8 +170,8 @@ libraries, wheel members and standard package caches fail that scan. The
 runtime check alone cannot inspect bytes hidden by those mounts.
 
 The saved-layer scan also rejects Git metadata (`.git` files, directories,
-links, and their contents) and the base images' internal
-`.CI_CONFIG_DO_NOT_PUSH_THIS_FILE_TO_PUBLIC.yaml` configuration. The Dockerfiles
+links, and their contents) and the internal build configuration inherited from NGC
+(`.CI_CONFIG_DO_NOT_PUSH_THIS_FILE_TO_PUBLIC.yaml`). The Dockerfiles
 remove these before flattening; runtime package code and license files remain.
 
 The verifier runs as root with a read-only filesystem, no network, no GPU, no
