@@ -4,64 +4,36 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import gc
-import math
 import shutil
 import sys
 import time
 import traceback
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
-from datetime import timedelta
+from collections.abc import Callable
 from pathlib import Path
 
 import torch
 import torch.distributed as dist
-import wandb
 from accelerate import Accelerator
-from PIL import Image
 from torch import nn
-from torch.distributed import DeviceMesh
 from tqdm import tqdm
 
-from model_training.constants import MAX_SEQUENCE_LENGTH
+from model_eval.validation import EvaluationRunner
+from model_eval.validation_config import EvaluationConfig, EvaluationContext, EvaluationIdentity
+from model_eval.validation_reporting import validation_media
+from model_eval.validation_tasks import build_evaluation_plan
+from model_training.net.cosmos3_transformer import conditioning_adapter_weight_norms, scope_to_query_ratios
+from model_training.net.scope import scope_statistics
 from model_training.pipeline.pipeline_base import ArtifixerPipelineBase
+from model_training.prompt_formats import prompt_payload_for_text_dropout
 from model_training.utils.train_utils import (
     barrier_if_distributed,
     checkpoint_is_complete,
     mark_checkpoint_complete,
-    tracker_logging_enabled,
     uses_wandb_logging,
 )
-from model_training.utils.video_io import save_video
-
-_VALIDATION_SYNC_TIMEOUT = timedelta(minutes=30)
-
-
-@dataclass(frozen=True)
-class ValidationTaskSpec:
-    key: str
-    num_neighbors: int
-    use_neighbors: bool = True
-    zero_rendered: bool = False
-    last_drop_fraction: float | None = None
-    zero_prompt: bool = False
-
-
-@dataclass
-class ValidationTask:
-    key: str
-    rendered_rgb: torch.Tensor
-    rendered_opacity: torch.Tensor
-    neighbors: torch.Tensor | None
-    camera_rays: torch.Tensor
-    w2cs: torch.Tensor
-    neighbor_w2cs: torch.Tensor | None
-    Ks: torch.Tensor
-    neighbor_Ks: torch.Tensor | None
-    prompt: torch.Tensor
-    num_inference_steps: int
-    rgb_gt: torch.Tensor
 
 
 class TrainerBase(ABC):
@@ -75,7 +47,6 @@ class TrainerBase(ABC):
         schedulers: list[torch.optim.lr_scheduler.LRScheduler],
         train_dataloader: torch.utils.data.DataLoader,
         val_datasets: dict[int, torch.utils.data.Dataset],
-        copy_val_to_device: bool = True,
         step_offset: int = 0,
     ):
         self.args = args
@@ -85,20 +56,14 @@ class TrainerBase(ABC):
         self.schedulers = schedulers
         self.train_dataloader = train_dataloader
         self.val_datasets = val_datasets
-        self.copy_val_to_device = copy_val_to_device
         self.step_offset = step_offset
+        self._zero_encode_cache: dict[tuple, torch.Tensor] = {}
+        self.evaluation = EvaluationRunner(
+            pipe, EvaluationConfig.from_args(args), EvaluationContext(accelerator.device, accelerator.print)
+        )
 
     @abstractmethod
     def training_batch(self, data: dict) -> tuple[torch.Tensor, dict]:
-        pass
-
-    @abstractmethod
-    def validation_batches(
-        self,
-        val_datasets: dict[int, torch.utils.data.Dataset],
-        validation_index: int,
-        save_dir: Path,
-    ) -> None:
         pass
 
     @abstractmethod
@@ -112,6 +77,18 @@ class TrainerBase(ABC):
     @abstractmethod
     def on_before_zero_grad(self) -> None:
         pass
+
+    def _prompt_kwargs(self, data: dict) -> dict[str, torch.Tensor]:
+        """Positive-prompt transformer kwargs; the attention mask exists only for token-id prompts."""
+        prompt_kwargs = {"encoder_hidden_states": data["encoded_prompt"]}
+        if "prompt_attention_mask" in data:
+            prompt_kwargs["encoder_attention_mask"] = data["prompt_attention_mask"]
+        return prompt_kwargs
+
+    @staticmethod
+    def _neighbor_camera_kwargs(neighbor_camera_rays: torch.Tensor | None) -> dict[str, torch.Tensor]:
+        """Only joint data supplies reference rays; omit the keyword for legacy/Wan callers."""
+        return {} if neighbor_camera_rays is None else {"neighbor_camera_rays": neighbor_camera_rays}
 
     def _should_checkpoint_for_timeout(self) -> bool:
         if self.args.should_checkpoint_flag is None:
@@ -180,19 +157,140 @@ class TrainerBase(ABC):
         barrier_if_distributed()
         mark_checkpoint_complete(project_dir, step, self.accelerator)
         barrier_if_distributed()
+        self._prune_completed_checkpoints(step)
+        barrier_if_distributed()
 
+    def _prune_completed_checkpoints(self, saved_step: int) -> None:
+        limit = getattr(self.args, "max_checkpoints", None)
+        if not self.accelerator.is_main_process or limit is None:
+            return
+        checkpoints_dir = Path(self.accelerator.project_dir) / "checkpoints"
+        # Leave incomplete saves and unrelated entries alone. Only this
+        # completed replacement authorizes removal of older complete saves.
+        try:
+            completed = sorted(
+                (
+                    (int(path.name.removeprefix("checkpoint_")), path)
+                    for path in checkpoints_dir.iterdir()
+                    if path.name.startswith("checkpoint_")
+                    and path.name.isascii()
+                    and path.name.removeprefix("checkpoint_").isdigit()
+                    and not path.is_symlink()
+                    and (path / "checkpoint_complete").is_file()
+                ),
+                key=lambda entry: entry[0],
+            )
+            if any(step > saved_step for step, _ in completed):
+                self.accelerator.print("Skipping checkpoint retention: newer completed checkpoints already exist")
+                return
+            for _, path in completed[:-limit]:
+                shutil.rmtree(path)
+        except OSError as error:
+            # The new checkpoint is already committed. A retention failure
+            # must not strand peers at the following barrier or revoke it.
+            self.accelerator.print(f"Checkpoint saved, but pruning older checkpoints failed: {error}")
+
+    def _save_timeout_checkpoint_and_ack(self, step: int) -> None:
+        project_dir = Path(self.accelerator.project_dir)
+        if checkpoint_is_complete(project_dir, step, self.accelerator):
+            raise RuntimeError(f"Timeout checkpoint_{step} is already complete; refusing to acknowledge a stale save")
+
+        self._save_state_with_commit_marker(step)
+
+        local_ack_succeeded = True
+        caught_error = None
+        if self.accelerator.is_main_process:
+            try:
+                request_flag = Path(self.args.should_checkpoint_flag)
+                request_token = request_flag.read_text().strip().replace("\n", " ")
+                if not request_token:
+                    # An empty token cannot be bound to a requeue
+                    # authorization, so refuse it instead of writing an ack
+                    # the launcher's gate cannot validate.
+                    raise RuntimeError(
+                        f"Checkpoint request flag {request_flag} carries no request token; "
+                        "the launcher must write a unique token into the flag (see "
+                        "model_training/slurm/lib/requeue_protocol.sh)."
+                    )
+                ack_path = Path(f"{request_flag}.complete")
+                tmp_path = ack_path.with_name(f".{ack_path.name}.tmp")
+                tmp_path.write_text(f"request={request_token}\nstep={step}\n")
+                tmp_path.replace(ack_path)
+            except Exception as e:
+                local_ack_succeeded = False
+                caught_error = e
+
+        if dist.is_initialized():
+            ack_succeeded_tensor = torch.tensor(
+                [int(local_ack_succeeded)],
+                device=self.accelerator.device,
+                dtype=torch.int32,
+            )
+            dist.all_reduce(ack_succeeded_tensor, op=dist.ReduceOp.MIN)
+            ack_succeeded = bool(ack_succeeded_tensor.item())
+        else:
+            ack_succeeded = local_ack_succeeded
+
+        if not ack_succeeded:
+            if caught_error is not None:
+                raise caught_error
+            raise RuntimeError(f"Failed to acknowledge timeout checkpoint_{step}")
+
+        barrier_if_distributed()
+
+    def _encode_zeros_cached(self, reference: torch.Tensor, *, neighbors: bool) -> torch.Tensor:
+        """Encode an all-zeros input shaped like ``reference`` through the frozen VAE, with caching.
+
+        The argmax-mode encoding of a zeros input is deterministic per shape
+        (and is not itself zeros), so it only needs to be computed once.
+        """
+        key = (neighbors, tuple(reference.shape), reference.dtype, reference.device)
+        cached = self._zero_encode_cache.get(key)
+        if cached is None:
+            zeros = torch.zeros_like(reference)
+            cached = self.pipe.encode_neighbors(zeros) if neighbors else self.pipe.encode_video_frames(zeros)
+            self._zero_encode_cache[key] = cached
+        return cached
+
+    def _sample_input_dropout(
+        self,
+        num_frames: int,
+        *,
+        device: torch.device | None = None,
+        is_source_rank: bool = True,
+        broadcast: Callable[[torch.Tensor], torch.Tensor] | None = None,
+    ) -> tuple[bool, int, bool, bool]:
+        """Choose conditioning inputs to drop, optionally synchronizing the choices across ranks."""
+        dropout_probs = torch.rand(3, device=device) if is_source_rank else torch.empty(3, device=device)
+        if broadcast is not None:
+            broadcast(dropout_probs)
+        drop_rendered, drop_text, ignore_neighbors = (dropout_probs < self.args.dropout_rate).tolist()
+        frames_to_drop = 0
+        if not drop_rendered:
+            frames_to_drop_tensor = (
+                torch.randint(0, num_frames, (1,), device=device)
+                if is_source_rank
+                else torch.empty(1, device=device, dtype=torch.long)
+            )
+            if broadcast is not None:
+                broadcast(frames_to_drop_tensor)
+            frames_to_drop = int(frames_to_drop_tensor.item())
+        return drop_rendered, frames_to_drop, drop_text, ignore_neighbors
+
+    # Non-CP batch preprocessing (main's contract for Trainer.training_batch).
+    # CP-aware trainers override this via ContextParallelVideoMixin, which is
+    # listed before TrainerBase in their MRO.
     def process_inputs(self, data: dict) -> dict[str, torch.Tensor | bool]:
-        batch_size, num_frames, _, height, width = data["rgb_gt"].shape
+        num_frames = data["rgb_gt"].shape[1]
         processed_data = {"rgb_gt": data["rgb_gt"]}
 
-        dropout_probs = torch.rand(3)
+        drop_rendered, frames_to_drop, drop_text, ignore_neighbors = self._sample_input_dropout(num_frames)
 
         opacity = data["opacity"].to(dtype=self.pipe.vae.dtype)
-        if dropout_probs[0] < self.args.dropout_rate:
-            condition = self.pipe.encode_video_frames(torch.zeros_like(data["rgb_rendered"]))
+        if drop_rendered:
+            condition = self._encode_zeros_cached(data["rgb_rendered"], neighbors=False)
             opacity = torch.zeros_like(opacity)
         else:
-            frames_to_drop = torch.randint(0, num_frames, (1,))
             if frames_to_drop > 0:
                 condition = self.pipe.encode_video_frames(
                     torch.cat(
@@ -203,6 +301,8 @@ class TrainerBase(ABC):
                         dim=1,
                     )
                 )
+                if opacity is data["opacity"]:
+                    opacity = opacity.clone()
                 opacity[:, -frames_to_drop:] = 0
             else:
                 condition = self.pipe.encode_video_frames(data["rgb_rendered"])
@@ -210,423 +310,106 @@ class TrainerBase(ABC):
         processed_data["condition"] = condition
         processed_data["opacity"] = opacity
 
-        encoded_prompt = data["encoded_prompt"]
-        if dropout_probs[1] < self.args.dropout_rate:
-            encoded_prompt = torch.zeros_like(encoded_prompt)
-        processed_data["encoded_prompt"] = encoded_prompt
+        processed_data.update(prompt_payload_for_text_dropout(data, drop_text=drop_text))
 
-        # Training must execute the neighbor branch on every rank: the per-block
-        # neighbor KV projections still have gradients even though patch embedding
-        # is shared. ``ignore_neighbors`` zeros the contribution after the branch.
-        processed_data["neighbors_condition"] = self.pipe.encode_neighbors(data["rgb_neighbors"])
-        processed_data["ignore_neighbors"] = dropout_probs[2] < self.args.dropout_rate
+        # Wan zeroes the reference output; Cosmos3 omits reference tokens.
+        # A cached placeholder avoids encoding images that will not affect the output.
+        if ignore_neighbors:
+            processed_data["neighbors_condition"] = self._encode_zeros_cached(data["rgb_neighbors"], neighbors=True)
+        else:
+            processed_data["neighbors_condition"] = self.pipe.encode_neighbors(data["rgb_neighbors"])
+        processed_data["ignore_neighbors"] = ignore_neighbors
         processed_data["neighbor_w2cs"] = data["neighbor_w2cs"]
         processed_data["neighbor_Ks"] = data["neighbor_Ks"]
         processed_data["camera_rays"] = data["camera_rays"].to(dtype=self.pipe.vae.dtype)
+        if data.get("neighbor_camera_rays") is not None:
+            processed_data["neighbor_camera_rays"] = data["neighbor_camera_rays"].to(dtype=self.pipe.vae.dtype)
         processed_data["w2cs"] = data["w2cs"]
         processed_data["Ks"] = data["Ks"]
 
         return processed_data
 
-    @staticmethod
-    def _build_validation_task_specs(val_datasets: dict[int, torch.utils.data.Dataset]) -> list[ValidationTaskSpec]:
-        specs = []
-
-        for num_neighbors in sorted(val_datasets):
-            specs.append(ValidationTaskSpec(key=f"default_{num_neighbors}", num_neighbors=num_neighbors))
-
-        fewest_neighbors = min(val_datasets.keys())
-
-        if specs[0].key != f"default_{fewest_neighbors}":
-            raise RuntimeError(f"Unexpected first validation task key: {specs[0].key}")
-
-        for last_drop in [0.25, 0.5, 0.75]:
-            specs.append(
-                ValidationTaskSpec(
-                    key=f"last_drop_{last_drop}_{fewest_neighbors}",
-                    num_neighbors=fewest_neighbors,
-                    last_drop_fraction=last_drop,
-                )
-            )
-
-        specs.extend(
-            [
-                ValidationTaskSpec(
-                    key=f"text_only_{fewest_neighbors}",
-                    num_neighbors=fewest_neighbors,
-                    use_neighbors=False,
-                    zero_rendered=True,
-                ),
-                ValidationTaskSpec(
-                    key=f"no_rendered_rgb_{fewest_neighbors}",
-                    num_neighbors=fewest_neighbors,
-                    zero_rendered=True,
-                ),
-                ValidationTaskSpec(
-                    key=f"neighbors_only_{fewest_neighbors}",
-                    num_neighbors=fewest_neighbors,
-                    zero_rendered=True,
-                    zero_prompt=True,
-                ),
-                ValidationTaskSpec(
-                    key=f"no_text_{fewest_neighbors}",
-                    num_neighbors=fewest_neighbors,
-                    zero_prompt=True,
-                ),
-                ValidationTaskSpec(
-                    key=f"no_neighbors_{fewest_neighbors}",
-                    num_neighbors=fewest_neighbors,
-                    use_neighbors=False,
-                ),
-                ValidationTaskSpec(
-                    key=f"no_neighbors_no_text_{fewest_neighbors}",
-                    num_neighbors=fewest_neighbors,
-                    use_neighbors=False,
-                    zero_prompt=True,
-                ),
-            ]
-        )
-
-        return specs
-
-    def _load_validation_batch(
-        self,
-        val_datasets: dict[int, torch.utils.data.Dataset],
-        num_neighbors: int,
-        validation_index: int,
-    ) -> dict:
-        data = torch.utils.data.default_collate([val_datasets[num_neighbors][validation_index]])
-        if not self.copy_val_to_device:
-            return data
-
-        return {
-            key: value.to(device=self.accelerator.device) if isinstance(value, torch.Tensor) else value
-            for key, value in data.items()
-        }
-
-    def _build_validation_task(
-        self,
-        val_datasets: dict[int, torch.utils.data.Dataset],
-        spec: ValidationTaskSpec,
-        validation_index: int,
-        num_inference_steps: int,
-    ) -> ValidationTask:
-        data = self._load_validation_batch(val_datasets, spec.num_neighbors, validation_index)
-        rendered_rgb = data["rgb_rendered"]
-        rendered_opacity = data["opacity"].to(dtype=self.pipe.vae.dtype)
-        prompt = data["encoded_prompt"]
-
-        if spec.zero_rendered:
-            rendered_rgb = torch.zeros_like(rendered_rgb)
-            rendered_opacity = torch.zeros_like(rendered_opacity)
-        elif spec.last_drop_fraction is not None:
-            frames_to_drop = int(rendered_rgb.shape[1] * spec.last_drop_fraction)
-            rendered_rgb = rendered_rgb.clone()
-            rendered_opacity = rendered_opacity.clone()
-            if frames_to_drop > 0:
-                rendered_rgb[:, -frames_to_drop:] = 0
-                rendered_opacity[:, -frames_to_drop:] = 0
-
-        if spec.zero_prompt:
-            prompt = torch.zeros_like(prompt)
-
-        return ValidationTask(
-            key=spec.key,
-            rendered_rgb=rendered_rgb,
-            rendered_opacity=rendered_opacity,
-            neighbors=data["rgb_neighbors"] if spec.use_neighbors else None,
-            camera_rays=data["camera_rays"].to(dtype=self.pipe.vae.dtype),
-            w2cs=data["w2cs"],
-            neighbor_w2cs=data["neighbor_w2cs"] if spec.use_neighbors else None,
-            Ks=data["Ks"],
-            neighbor_Ks=data["neighbor_Ks"] if spec.use_neighbors else None,
-            prompt=prompt,
-            num_inference_steps=num_inference_steps,
-            rgb_gt=data["rgb_gt"],
-        )
-
-    @staticmethod
-    def _choose_cp_group_size(
-        cp_frame_divisor: int,
-        world_size: int,
-        num_tasks: int,
-    ) -> int:
-        """Pick CP group size that minimizes validation wall-clock time.
-
-        Tries all divisors of ``cp_frame_divisor`` (so no temporal padding is
-        needed) and picks the one that minimizes
-        ``ceil(num_tasks / num_groups) / cp_size``.
-
-        Leftover ranks (``world_size % cp_group_size != 0``) become spectators
-        that run a minimal dummy forward pass for FSDP synchronization.  Since
-        FSDP all-gathers only reconstruct parameters (input-size-independent),
-        spectators process a tiny input and never bottleneck CP-active ranks.
-
-        Examples::
-
-            # cp_frame_divisor=21, world_size=9, num_tasks=12
-            #   d=1:  groups=9,  rounds=ceil(12/9)=2,   time=2/1=2.00
-            #   d=3:  groups=3,  rounds=ceil(12/3)=4,   time=4/3=1.33  <-- best
-            #   d=7:  groups=1,  rounds=ceil(12/1)=12,  time=12/7=1.71
-            #   d=21: exceeds world_size, skip
-            # Returns 3
-
-            # With block-causal (21 frames, frames_per_block=7):
-            #   trainer computes cp_frame_div = gcd(21, num_blocks=3) = 3
-            #   d=1: groups=9, rounds=2, time=2.00
-            #   d=3: groups=3, rounds=4, time=1.33  <-- best
-            # Returns 3 (CP=3, each rank gets 1 temporal block)
-        """
-        if world_size <= 1:
-            return 1
-        best_size, best_time = 1, float("inf")
-        for d in range(1, cp_frame_divisor + 1):
-            if cp_frame_divisor % d != 0 or d > world_size:
-                continue
-            num_groups = world_size // d
-            if num_groups == 0:
-                continue
-            rounds = math.ceil(num_tasks / num_groups)
-            time = rounds / d
-            if time < best_time:
-                best_time = time
-                best_size = d
-        return best_size
-
-    def _validation_prompt_dim(self) -> int:
+    @contextlib.contextmanager
+    def validation_context(self):
         transformer = self.pipe.transformer
-        unwrapped_transformer = getattr(transformer, "module", transformer)
-
-        condition_embedder = getattr(unwrapped_transformer, "condition_embedder", None)
-        text_embedder = getattr(condition_embedder, "text_embedder", None)
-        linear_1 = getattr(text_embedder, "linear_1", None)
-        if linear_1 is not None and hasattr(linear_1, "in_features"):
-            return int(linear_1.in_features)
-
-        config = getattr(transformer, "config", None)
-        text_dim = getattr(config, "text_dim", None)
-        if text_dim is not None:
-            return int(text_dim)
-
-        blocks = getattr(unwrapped_transformer, "blocks", None)
-        if blocks is not None:
-            return int(blocks[0].attn2.to_k.in_features)
-
-        raise RuntimeError("Could not infer validation prompt embedding dimension")
-
-    @staticmethod
-    def _build_minimal_validation_task(
-        key: str,
-        num_frames: int,
-        num_latent_frames: int,
-        prompt_dim: int,
-        num_inference_steps: int,
-        device: torch.device,
-        vae_dtype: torch.dtype,
-    ) -> ValidationTask:
-        """Build a minimal-resolution task for ranks that only need FSDP sync.
-
-        Inactive validation groups must still call ``forward_inference`` so that
-        FSDP all-gathers fire, but their output is discarded.  Keep the **same
-        temporal extent** as real tasks (so the KV-cache pipeline produces the
-        same number of chunks / transformer calls — required for FSDP sync)
-        but uses tiny 16×16 spatial resolution (1 token per frame instead of
-        ~1560), making per-layer compute negligible.
-
-        ``vae_dtype`` (typically bf16) is used for opacity and camera_rays to
-        match the dtype that ``_build_validation_task`` produces — these
-        tensors bypass the VAE and are mixed directly with bf16 latents in
-        ``prepare_latents``, so a float32 mismatch would upcast everything.
-        """
-        min_hw = 16  # divisible by vae_spatial * patch = 8 * 2 = 16
-        pixel_dtype = torch.float32  # pixels go through the VAE, which casts
-        B = 1
-
-        return ValidationTask(
-            key=key,
-            rendered_rgb=torch.zeros(B, num_frames, 3, min_hw, min_hw, device=device, dtype=pixel_dtype),
-            rendered_opacity=torch.zeros(B, num_frames, min_hw, min_hw, device=device, dtype=vae_dtype),
-            neighbors=None,  # None → skips encode_neighbors, PRoPE, and neighbor cross-attn entirely
-            # camera_rays from compute_camera_rays are at latent temporal resolution
-            # (poses averaged in groups of 4 for VAE temporal compression), so match that.
-            camera_rays=torch.zeros(B, num_latent_frames, min_hw, min_hw, 6, device=device, dtype=vae_dtype),
-            w2cs=torch.eye(4, device=device).unsqueeze(0).unsqueeze(0).expand(B, num_latent_frames, -1, -1),
-            neighbor_w2cs=None,
-            Ks=torch.eye(3, device=device).unsqueeze(0).unsqueeze(0).expand(B, num_latent_frames, -1, -1),
-            neighbor_Ks=None,
-            prompt=torch.zeros(B, MAX_SEQUENCE_LENGTH, prompt_dim, device=device, dtype=torch.bfloat16),
-            num_inference_steps=num_inference_steps,
-            rgb_gt=torch.zeros(B, num_frames, 3, min_hw, min_hw, device=device, dtype=pixel_dtype),
-        )
-
-    def _run_and_save_validation_tasks(
-        self,
-        val_datasets: dict[int, torch.utils.data.Dataset],
-        validation_index: int,
-        num_inference_steps: int,
-        save_dir: Path,
-    ) -> None:
-        task_specs = self._build_validation_task_specs(val_datasets)
-        world_size = dist.get_world_size() if dist.is_initialized() else 1
-        rank = dist.get_rank() if dist.is_initialized() else 0
-        validation_sync_group = (
-            dist.new_group(backend="nccl", timeout=_VALIDATION_SYNC_TIMEOUT) if dist.is_initialized() else None
-        )
-
+        was_training = transformer.training
+        transformer.eval()
+        ema = getattr(self, "ema", None)
+        ema_context = ema.apply(enabled=ema.validation_active) if ema is not None else contextlib.nullcontext()
         try:
-            if rank == 0:
-                save_dir.mkdir(parents=True, exist_ok=True)
-
-            barrier_if_distributed(validation_sync_group)
-
-            # Hybrid task-parallel + context-parallel validation.
-            # GPUs are split into CP groups; each group cooperates on one task via
-            # all-gather K/V attention, and different groups run different tasks in
-            # parallel.  For block-causal attention (diffusion forcing), CP is still
-            # possible but frames_per_rank must be divisible by frames_per_block,
-            # which constrains valid CP sizes to divisors of num_blocks.
-            vae_temporal = self.pipe.vae.config.scale_factor_temporal
-            reference_dataset = val_datasets[task_specs[0].num_neighbors]
-            num_latent_frames = (reference_dataset.num_frames - 1) // vae_temporal + 1
-            cp_frame_div = self.pipe.cp_frame_divisor(num_latent_frames)
-            if self.pipe.transformer.frames_per_block is not None:
-                # Block-causal CP: cp_size must also divide num_blocks so that
-                # each rank gets a whole number of temporal blocks.
-                num_blocks = num_latent_frames // self.pipe.transformer.frames_per_block
-                cp_frame_div = math.gcd(cp_frame_div, num_blocks)
-            cp_group_size = self._choose_cp_group_size(
-                cp_frame_div,
-                world_size,
-                len(task_specs),
-            )
-            num_groups = world_size // cp_group_size
-            group_index = rank // cp_group_size
-            group_rank = rank % cp_group_size
-            # Ranks that don't fit into a complete group are spectators.
-            # Spectators run a tiny dummy forward to keep FSDP all-gathers in sync
-            # without bottlenecking CP-active ranks (FSDP collectives are
-            # input-size-independent).
-            is_spectator = group_index >= num_groups
-            num_spectators = world_size - num_groups * cp_group_size
-            max_validation_task_groups = getattr(self.args, "max_validation_task_groups", None)
-            if max_validation_task_groups is None or max_validation_task_groups <= 0:
-                active_task_groups = num_groups
-            else:
-                active_task_groups = min(num_groups, max_validation_task_groups)
-            active_task_groups = max(1, active_task_groups)
-            rounds = math.ceil(len(task_specs) / active_task_groups)
-
-            if rank == 0:
-                print(
-                    f"Validation CP: cp_size={cp_group_size}, groups={num_groups}, "
-                    f"active_task_groups={active_task_groups}, "
-                    f"spectators={num_spectators}, tasks={len(task_specs)}, "
-                    f"rounds={rounds}"
-                )
-
-            dummy_task = self._build_minimal_validation_task(
-                "__dummy__",
-                reference_dataset.num_frames,
-                num_latent_frames,
-                self._validation_prompt_dim(),
-                num_inference_steps,
-                self.accelerator.device,
-                self.pipe.vae.dtype,
-            )
-
-            if cp_group_size > 1:
-                # All ranks must participate in DeviceMesh creation (it involves
-                # dist.new_group which is a world-collective in some PyTorch versions).
-                # Build the full list of CP group rank-lists so every rank calls
-                # new_group the same number of times.
-                all_group_ranks = [list(range(g * cp_group_size, (g + 1) * cp_group_size)) for g in range(num_groups)]
-                # Spectators form their own singleton group(s) for the collective.
-                spectator_ranks = list(range(num_groups * cp_group_size, world_size))
-                if spectator_ranks:
-                    all_group_ranks.append(spectator_ranks)
-
-                my_mesh = None
-                for group_ranks in all_group_ranks:
-                    mesh = DeviceMesh(self.accelerator.device.type, group_ranks)
-                    if rank in group_ranks:
-                        my_mesh = mesh
-
-                if not is_spectator:
-                    self.pipe.transformer.enable_context_parallel(my_mesh)
-
-            try:
-                # Round-robin tasks across active groups; inactive groups run a
-                # minimal forward so FSDP collectives stay aligned without
-                # increasing full-resolution validation memory fanout.
-                # The sync group uses a longer timeout because only group_rank 0 saves results.
-                for round_idx in range(rounds):
-                    barrier_if_distributed(validation_sync_group)
-                    task_index = round_idx * active_task_groups + (group_index if not is_spectator else 0)
-                    is_real_task = (
-                        not is_spectator and group_index < active_task_groups and task_index < len(task_specs)
-                    )
-
-                    if is_real_task:
-                        task = self._build_validation_task(
-                            val_datasets,
-                            task_specs[task_index],
-                            validation_index,
-                            num_inference_steps,
-                        )
-                    else:
-                        task = dummy_task
-
-                    output = self.pipe.forward_inference(
-                        rendered_rgb=task.rendered_rgb,
-                        rendered_opacity=task.rendered_opacity,
-                        neighbors=task.neighbors,
-                        camera_rays=task.camera_rays,
-                        w2cs=task.w2cs,
-                        neighbor_w2cs=task.neighbor_w2cs,
-                        Ks=task.Ks,
-                        neighbor_Ks=task.neighbor_Ks,
-                        prompt=task.prompt,
-                        num_inference_steps=task.num_inference_steps,
-                        show_progress=rank == 0,
-                        progress_bar_leave=False,
-                    )
-
-                    if is_real_task and group_rank == 0:
-                        self._save_validation_result(output, task, save_dir)
-
-                    del output
-                    del task
-                    torch.cuda.empty_cache()
-                    gc.collect()
-            finally:
-                if cp_group_size > 1 and not is_spectator:
-                    self.pipe.transformer.disable_context_parallel()
-
-            barrier_if_distributed(validation_sync_group)
+            with torch.no_grad(), ema_context:
+                yield
         finally:
-            if validation_sync_group is not None:
-                dist.destroy_process_group(validation_sync_group)
+            transformer.train(was_training)
 
-    def _save_validation_result(self, output: torch.Tensor, task: ValidationTask, save_dir: Path) -> None:
-        result_rows = [
-            torch.cat(
-                [output.cpu().squeeze(0), task.rgb_gt.cpu().squeeze(0), task.rendered_rgb.cpu().squeeze(0)], dim=-1
-            )
-        ]
-        if task.neighbors is not None:
-            for neighbor_index in range(0, task.neighbors.shape[1], 3):
-                result_rows.append(
-                    torch.cat([x.cpu() for x in task.neighbors[0, neighbor_index : neighbor_index + 3]], dim=-1)
-                    .unsqueeze(0)
-                    .expand(result_rows[0].shape[0], -1, -1, -1)
+    def _check_models_finite(self, kind: str, data: dict, loss: torch.Tensor) -> None:
+        for i, model in enumerate(self.accelerator._models):
+            for name, param in model.named_parameters():
+                value = param.grad if kind == "grad" else param
+                if value is None or torch.isfinite(value).all():
+                    continue
+                torch.save(
+                    [data, loss, param],
+                    self.args.project_dir
+                    / f"train_error-{kind}-{i}-{self.accelerator.process_index}-{self.get_step()}.pt",
                 )
-        result = torch.cat(result_rows, dim=-2)
-        if result.shape[0] == 1:
-            Image.fromarray((result.clamp(0, 1).squeeze(0).permute(1, 2, 0) * 255).byte().numpy()).save(
-                save_dir / f"{task.key}.png"
+                noun = "parameter gradient" if kind == "grad" else "parameter"
+                raise ValueError(f"Model {i} {noun} {name} contains non-finite values")
+
+    def _maybe_checkpoint(self) -> None:
+        # Check only at synchronized step boundaries so all ranks
+        # save the same logical iteration before Slurm requeues.
+        if self._should_checkpoint_for_timeout():
+            self.accelerator.print(
+                f"Saving checkpoint at iteration {self.get_step()} and exiting with timeout signal for requeue"
             )
-        else:
-            save_video(result.clamp(0, 1), save_dir / f"{task.key}.mp4", fps=15)
+            self._save_timeout_checkpoint_and_ack(self.get_step())
+            self.accelerator.print(f"Exiting with timeout signal for requeue at iteration {self.get_step()}")
+            sys.exit(124)
+
+        if self.get_step() % self.args.save_steps == 0:
+            torch.cuda.empty_cache()
+            gc.collect()
+            self._save_state_with_commit_marker(self.get_step())
+
+    def _validation_step(self, log_dict: dict) -> None:
+        """Training owns when to evaluate and which raw/EMA weights to expose."""
+        step = self.get_step()
+        index = max(step // self.args.validation_steps - 1, 0)
+        save_dir = self.args.project_dir / "val" / f"step_{step:06d}"
+        runner = self.evaluation
+        plan = build_evaluation_plan(self.val_datasets, runner.config, index)
+        ema = getattr(self, "ema", None)
+        identity = EvaluationIdentity(
+            project_dir=self.args.project_dir,
+            step=step,
+            initial_checkpoint=getattr(self.args, "base_checkpoint_dir", None),
+            weights="ema" if ema is not None and ema.validation_active else "raw",
+            training_algorithm=type(self).__name__,
+        )
+        if ema is not None:
+            log_dict["val/ema_active"] = int(ema.validation_active)
+            log_dict["val/ema_updates"] = ema.ema_updates
+        log_dict.update(conditioning_adapter_weight_norms(self.pipe.transformer))
+        log_dict.update(scope_statistics(self.pipe.transformer))
+        scope_samples = []
+        capture_scope = hasattr(self.pipe.transformer, "_scope_accumulator")
+        with self.validation_context():
+            if capture_scope:
+                self.pipe.transformer._scope_accumulator = scope_samples
+            try:
+                regular = runner.run_pass(plan.datasets, plan.regular, save_dir, weights=identity.weights)
+            finally:
+                if capture_scope:
+                    self.pipe.transformer._scope_accumulator = None
+            panel = runner.run_pass(plan.datasets, plan.panel, None, weights=identity.weights)
+        log_dict.update(scope_to_query_ratios(scope_samples))
+        result = runner.finish(plan, identity, regular, panel, save_dir)
+        log_dict.update(result.scalars)
+        if self.accelerator.is_main_process and uses_wandb_logging(self.args.log_with):
+            log_dict.update(validation_media(plan, save_dir))
+        torch.cuda.empty_cache()
+        gc.collect()
 
     def train(self) -> None:
         pbar = tqdm(total=self.args.max_iterations, disable=not self.accelerator.is_local_main_process)
@@ -640,7 +423,10 @@ class TrainerBase(ABC):
 
                 with self.accelerator.accumulate(*self.to_accumulate()):
                     loss, metrics = self.training_batch(data)
-                    log_dict.update({f"train/{k}": v for k, v in metrics.items()})
+                    self.accelerator.backward(loss)
+
+                    # Synced after backward is enqueued so the host does not
+                    # stall on the forward pass before launching it.
                     if not torch.isfinite(loss).all():
                         torch.save(
                             [data, loss],
@@ -652,20 +438,15 @@ class TrainerBase(ABC):
                         )
 
                     log_dict["train/loss"] = loss.item()
-                    self.accelerator.backward(loss)
+                    log_dict.update({f"train/{k}": v.item() if torch.is_tensor(v) else v for k, v in metrics.items()})
 
-                    self.on_before_optimizer_step()
+                    if self.accelerator.sync_gradients:
+                        # Clip only on the syncing micro-batch: clipping partial
+                        # accumulated gradients would distort the window.
+                        self.on_before_optimizer_step()
 
                     if self.args.check_state_finite:
-                        for i, model in enumerate(self.accelerator._models):
-                            for name, param in model.named_parameters():
-                                if param.grad is not None and (not torch.isfinite(param.grad).all()):
-                                    torch.save(
-                                        [data, loss, param],
-                                        self.args.project_dir
-                                        / f"train_error-grad-{i}-{self.accelerator.process_index}-{self.get_step()}.pt",
-                                    )
-                                    raise ValueError(f"Model {i} parameter gradient {name} contains non-finite values")
+                        self._check_models_finite("grad", data, loss)
 
                     for optimizer in self.optimizers:
                         optimizer.step()
@@ -673,15 +454,7 @@ class TrainerBase(ABC):
                         scheduler.step()
 
                     if self.args.check_state_finite:
-                        for i, model in enumerate(self.accelerator._models):
-                            for name, param in model.named_parameters():
-                                if not torch.isfinite(param).all():
-                                    torch.save(
-                                        [data, loss, param],
-                                        self.args.project_dir
-                                        / f"train_error-param-{i}-{self.accelerator.process_index}-{self.get_step()}.pt",
-                                    )
-                                    raise ValueError(f"Model {i} parameter {name} contains non-finite values")
+                        self._check_models_finite("param", data, loss)
 
                     self.on_before_zero_grad()
 
@@ -689,62 +462,21 @@ class TrainerBase(ABC):
                         optimizer.zero_grad()
 
                 if self.accelerator.sync_gradients:
-                    # Check only at synchronized step boundaries so all ranks
-                    # save the same logical iteration before Slurm requeues.
-                    if self._should_checkpoint_for_timeout():
-                        self.accelerator.print(
-                            f"Saving checkpoint at iteration {self.get_step()} and exiting with timeout signal for requeue"
-                        )
-                        self._save_state_with_commit_marker(self.get_step())
-                        self.accelerator.print(
-                            f"Exiting with timeout signal for requeue at iteration {self.get_step()}"
-                        )
-                        sys.exit(124)
+                    self._maybe_checkpoint()
 
-                    if self.get_step() % self.args.save_steps == 0:
-                        self.accelerator.project_configuration.iteration = self.get_step()
-                        torch.cuda.empty_cache()
-                        gc.collect()
-                        self._save_state_with_commit_marker(self.get_step())
+                    is_validation_step = self.get_step() % self.args.validation_steps == 0
+                    if is_validation_step:
+                        self._validation_step(log_dict)
 
-                    if self.get_step() % self.args.validation_steps == 0:
-                        torch.cuda.empty_cache()
-                        gc.collect()
-
-                        # Validation step 100 uses logical sample 0, step 200
-                        # uses sample 1, etc. This preserves the old iterator
-                        # ordering without materializing all batches on all ranks.
-                        validation_index = max(self.get_step() // self.args.validation_steps - 1, 0)
-                        save_dir = self.args.project_dir / "val" / f"step_{self.get_step():06d}"
-
-                        self.validation_batches(self.val_datasets, validation_index, save_dir)
-
-                        if self.accelerator.is_main_process and uses_wandb_logging(self.args.log_with):
-                            first_val = self._load_validation_batch(
-                                self.val_datasets,
-                                min(self.val_datasets.keys()),
-                                validation_index,
-                            )
-                            caption = f"{first_val['prompt_file'][0]}: {first_val['prompt'][0]}"
-                            for file in save_dir.glob("*.png"):
-                                log_dict[f"val/{file.stem}"] = wandb.Image(file, caption=caption)
-                            for file in save_dir.glob("*.mp4"):
-                                log_dict[f"val/{file.stem}"] = wandb.Video(
-                                    str(file), caption=caption, fps=15, format="mp4"
-                                )
-                            del first_val
-
-                        torch.cuda.empty_cache()
-                        gc.collect()
-
-                    if tracker_logging_enabled(self.args.log_with):
+                    if uses_wandb_logging(self.args.log_with):
                         self.accelerator.log(log_dict, step=self.get_step())
-                    # Barrier after logging: rank 0 may spend extra time uploading
-                    # validation images/videos via wandb while other ranks only log
-                    # scalars. Without this barrier the faster ranks re-enter the
-                    # dataloader (triggering accelerate's RNG-sync broadcast) before
-                    # rank 0 is ready, causing an NCCL timeout.
-                    barrier_if_distributed()
+                    if is_validation_step:
+                        # Barrier after logging: rank 0 may spend extra time uploading
+                        # validation images/videos via wandb while other ranks only log
+                        # scalars. Without this barrier the faster ranks re-enter the
+                        # dataloader (triggering accelerate's RNG-sync broadcast) before
+                        # rank 0 is ready, causing an NCCL timeout.
+                        barrier_if_distributed()
                     pbar.update(1)
                     data_loading_start_time = time.time()
 

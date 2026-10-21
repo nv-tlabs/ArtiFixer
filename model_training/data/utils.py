@@ -11,6 +11,8 @@ This module provides common functionality for:
 - Image loading
 """
 
+import functools
+import math
 import warnings
 from collections import defaultdict
 from dataclasses import dataclass
@@ -21,7 +23,6 @@ from typing import Any, List, Set, Tuple
 from zipfile import ZipFile
 
 import h5py
-import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -30,7 +31,10 @@ from scipy.spatial.transform import Rotation as R
 from threedgrut.datasets.camera_models import OpenCVPinholeCameraModelParameters, ShutterType, pixels_to_image_points
 
 from model_training.constants import MAX_SEQUENCE_LENGTH
+from model_training.cosmos3_text import pad_cosmos3_input_ids
 from model_training.data.scene_utils import downsampled_image_path, scene_zip_member
+from model_training.model_profiles import CAMERA_POSE_ALIGNMENTS
+from model_training.prompt_formats import COSMOS3_PROMPT_FORMAT, WAN_T5_PROMPT_FORMAT
 from model_training.utils.pose_utils import invert_SE3
 
 # =============================================================================
@@ -280,75 +284,99 @@ def generate_inference_pairs(
 # =============================================================================
 
 
-def load_encoded_prompt(
-    prompt_paths: List[Path],
-    generator: torch.Generator | None = None,
-) -> tuple[torch.Tensor, str]:
-    """
-    Load an encoded prompt from a random prompt file.
+def decode_and_pad_prompt(prompt_dataset: h5py.Dataset) -> torch.Tensor:
+    """Decode an encoded prompt (stored as uint16 since numpy lacks bfloat16) and zero-pad to MAX_SEQUENCE_LENGTH."""
+    encoded_prompt = torch.tensor(prompt_dataset[:], dtype=torch.uint16).view(torch.bfloat16)
+    assert (
+        encoded_prompt.shape[0] <= MAX_SEQUENCE_LENGTH
+    ), f"Wan prompt length {encoded_prompt.shape[0]} exceeds MAX_SEQUENCE_LENGTH={MAX_SEQUENCE_LENGTH}"
+    return torch.cat(
+        [
+            encoded_prompt,
+            torch.zeros(
+                MAX_SEQUENCE_LENGTH - encoded_prompt.shape[0],
+                encoded_prompt.shape[1],
+                dtype=torch.bfloat16,
+            ),
+        ],
+        dim=0,
+    )
+
+
+def load_prompt_payload(
+    prompt_file: h5py.File,
+    prompt_dataset: h5py.Dataset,
+    *,
+    prompt_format: str = WAN_T5_PROMPT_FORMAT,
+) -> dict[str, torch.Tensor]:
+    """Decode one prompt dataset into the dataset->trainer prompt payload schema.
+
+    Single home for the load-bearing prompt contract: the train path
+    (dl3dv_base) and the eval path (load_prompt_payload_from_path) both
+    delegate here so they cannot silently diverge.
 
     Args:
-        prompt_paths: List of paths to prompt HDF5 files
-        generator: Random generator for selection
-
-    Returns:
-        Tuple of (encoded_prompt tensor, caption string)
+        prompt_file: Open prompt HDF5 file (Cosmos3 stores the shared negative
+            prompt and pad token as file-level attributes).
+        prompt_dataset: The selected per-window prompt dataset within the file.
+        prompt_format: WAN_T5_PROMPT_FORMAT (T5 embeddings) or
+            COSMOS3_PROMPT_FORMAT (token ids + attention masks).
     """
-    if not prompt_paths:
-        return (torch.zeros(MAX_SEQUENCE_LENGTH, 4096, dtype=torch.bfloat16), "")
+    assert prompt_format in (
+        WAN_T5_PROMPT_FORMAT,
+        COSMOS3_PROMPT_FORMAT,
+    ), f"Unsupported prompt_format: {prompt_format!r}"
+    if prompt_format == WAN_T5_PROMPT_FORMAT:
+        return {"encoded_prompt": decode_and_pad_prompt(prompt_dataset)}
 
-    prompt_idx = torch.randint(0, len(prompt_paths), size=(1,), generator=generator).item()
-    prompt_path = prompt_paths[prompt_idx]
+    # The run's prompt_format decides the decode; the files are trusted to
+    # match (pointing PROMPT_DIR at the wrong corpus fails naturally on the
+    # missing attrs below).
+    pad_token_id = int(prompt_file.attrs["pad_token_id"])
+    encoded_prompt, prompt_attention_mask = pad_cosmos3_input_ids(
+        prompt_dataset[:],
+        pad_token_id=pad_token_id,
+    )
+    encoded_negative_prompt, negative_prompt_attention_mask = pad_cosmos3_input_ids(
+        prompt_file.attrs["negative_input_ids"],
+        pad_token_id=pad_token_id,
+    )
+    return {
+        "encoded_prompt": encoded_prompt,
+        "prompt_attention_mask": prompt_attention_mask,
+        "encoded_negative_prompt": encoded_negative_prompt,
+        "negative_prompt_attention_mask": negative_prompt_attention_mask,
+    }
 
+
+def load_prompt_payload_from_path(
+    prompt_path: Path,
+    *,
+    prompt_format: str = WAN_T5_PROMPT_FORMAT,
+) -> tuple[dict[str, torch.Tensor], str]:
+    """Load the encoded prompt payload and caption from one prompt file.
+
+    Evaluation conditions on exactly one caption record per file: a
+    multi-record file would silently condition on whichever record sorts
+    first, so it is rejected as a data error (same contract as
+    DL3DVHdf5EvalDataset._prompt_paths_for_scene).
+    """
     with h5py.File(prompt_path, "r") as f:
-        start_frame_candidates = list(f.keys())
-        prompt_dataset = f[start_frame_candidates[0]]
-
-        encoded_prompt = torch.tensor(prompt_dataset[:], dtype=torch.uint16).view(torch.bfloat16)
-        encoded_prompt = torch.cat(
-            [
-                encoded_prompt,
-                torch.zeros(
-                    MAX_SEQUENCE_LENGTH - encoded_prompt.shape[0],
-                    encoded_prompt.shape[1],
-                    dtype=torch.bfloat16,
-                ),
-            ],
-            dim=0,
+        num_records = len(f)
+        if num_records != 1:
+            raise ValueError(
+                f"Prompt file {prompt_path} holds {num_records} caption records; "
+                "evaluation conditions on exactly one"
+            )
+        prompt_dataset = next(iter(f.values()))
+        payload = load_prompt_payload(
+            f,
+            prompt_dataset,
+            prompt_format=prompt_format,
         )
-
         caption = prompt_dataset.attrs.get("caption", "")
 
-    return encoded_prompt, caption
-
-
-def load_frames_from_paths(
-    base_dir: Path,
-    scene_id: str,
-    file_paths: List[str],
-    downsample_factor: int = 4,
-) -> torch.Tensor:
-    """
-    Load frames from disk given file paths.
-
-    Args:
-        base_dir: Base directory containing scene folders
-        scene_id: Scene identifier
-        file_paths: List of relative file paths within the scene
-        downsample_factor: Downsample factor for image path substitution
-
-    Returns:
-        Tensor of shape (N, C, H, W) with values in [0, 1]
-    """
-    frames = []
-    for file_path in file_paths:
-        file_path = downsampled_image_path(file_path, downsample_factor)
-        with Image.open(base_dir / scene_id / file_path) as image:
-            frames.append(np.asarray(image.convert("RGB")))
-
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", UserWarning)
-        return torch.FloatTensor(np.stack(frames)).permute(0, 3, 1, 2) / 255.0
+    return payload, caption
 
 
 def load_frames_from_zip(
@@ -365,22 +393,6 @@ def load_frames_from_zip(
         with zf.open(scene_zip_member(scene_id if scene_has_subdir else "", file_path), "r") as f:
             with Image.open(BytesIO(f.read())) as image:
                 frames.append(np.asarray(image.convert("RGB")))
-
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", UserWarning)
-        return torch.FloatTensor(np.stack(frames)).permute(0, 3, 1, 2) / 255.0
-
-
-
-def load_frames_from_dir(scene_root: Path, file_paths: List[str], downsample_factor: int = 4) -> torch.Tensor:
-    """Load frames from an extracted DL3DV scene directory."""
-    frames = []
-    for file_path in file_paths:
-        image_path = scene_root / downsampled_image_path(file_path, downsample_factor)
-        if not image_path.is_file():
-            raise FileNotFoundError(f"Missing frame: {image_path}")
-        with Image.open(image_path) as image:
-            frames.append(np.asarray(image.convert("RGB")))
 
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", UserWarning)
@@ -422,11 +434,13 @@ def load_indexed_frames(
         return torch.FloatTensor(np.stack(frames)).permute(0, 3, 1, 2) / 255.0
 
 
-def resize_to_multiple_of_16(tensor: torch.Tensor) -> torch.Tensor:
-    """Resize tensor spatial dimensions to be multiples of 16."""
+def resize_to_multiple(tensor: torch.Tensor, multiple: int) -> torch.Tensor:
+    """Resize tensor spatial dimensions to be multiples of ``multiple``."""
+    if multiple <= 0:
+        raise ValueError(f"multiple must be positive, got {multiple}")
     h, w = tensor.shape[-2:]
-    new_h = round(h / 16) * 16
-    new_w = round(w / 16) * 16
+    new_h = round(h / multiple) * multiple
+    new_w = round(w / multiple) * multiple
     if new_h != h or new_w != w:
         return F.interpolate(tensor, (new_h, new_w), mode="bilinear")
     return tensor
@@ -464,19 +478,130 @@ def _frame_intrinsics(transforms: dict, frame: dict) -> torch.Tensor:
     return _intrinsics_vector(intrinsics)
 
 
+def frame_intrinsics_for(transforms: dict, indices: List[int]) -> torch.Tensor:
+    """Read indexed frame lenses; without frame records, use only the index count to repeat global lenses."""
+    if len(indices) == 0:
+        return torch.empty((0, 8), dtype=torch.float32)
+    frames = transforms.get("frames")
+    if not frames:
+        return _intrinsics_tensor(transforms, len(indices))
+    return torch.stack([_frame_intrinsics(transforms, frames[index]) for index in indices])
+
+
 def _intrinsics_tensor(intrinsics: dict, count: int) -> torch.Tensor:
     return _intrinsics_vector(intrinsics).unsqueeze(0).expand(count, -1).clone()
 
 
-def _average_temporal_intrinsics(intrinsics: torch.Tensor, skip_vae_check: bool) -> torch.Tensor:
-    averaged = [intrinsics[0]]
+def _latent_frame_count(num_raw_frames: int, temporal_scale: int, *, skip_vae_check: bool) -> int:
+    assert num_raw_frames > 0, f"num_raw_frames must be positive, got {num_raw_frames}"
+    assert temporal_scale > 0, f"temporal_scale must be positive, got {temporal_scale}"
+    if not skip_vae_check:
+        assert (
+            num_raw_frames - 1
+        ) % temporal_scale == 0, f"Frames should be 1 + {temporal_scale}*n for VAE, got {num_raw_frames}"
+    return 1 + math.ceil((num_raw_frames - 1) / temporal_scale)
+
+
+def _latent_index_raw_bounds(latent_index: int, num_raw_frames: int, temporal_scale: int) -> tuple[int, int]:
+    assert latent_index >= 0, f"latent_index must be non-negative, got {latent_index}"
+    assert num_raw_frames > 0, f"num_raw_frames must be positive, got {num_raw_frames}"
+    if latent_index == 0:
+        return 0, 1
+    start = 1 + temporal_scale * (latent_index - 1)
+    end = min(1 + temporal_scale * latent_index, num_raw_frames)
+    assert end > start, f"Empty raw frame group for latent index {latent_index}"
+    return start, end
+
+
+def latent_index_representative_raw_frame(
+    latent_index: int,
+    num_raw_frames: int,
+    temporal_scale: int = 4,
+    pose_alignment: str = "mean",
+) -> int:
+    """Raw frame whose camera stands in for ``latent_index``'s conditioning pose: the group's
+    last frame under ``last`` alignment (exact), its midpoint under ``mean`` (a group average)."""
+    assert (
+        pose_alignment in CAMERA_POSE_ALIGNMENTS
+    ), f"unknown pose_alignment {pose_alignment!r}; expected one of {CAMERA_POSE_ALIGNMENTS}"
+    raw_start, raw_end = _latent_index_raw_bounds(latent_index, num_raw_frames, temporal_scale)
+    if pose_alignment == "last":
+        return raw_end - 1
+    return (raw_start + raw_end - 1) // 2
+
+
+def _normalize_latent_slice(
+    latent_slice: tuple[int, int] | None,
+    *,
+    num_latent_frames: int,
+) -> tuple[int, int]:
+    if latent_slice is None:
+        return 0, num_latent_frames
+    latent_start, latent_end = latent_slice
+    assert (
+        0 <= latent_start < latent_end <= num_latent_frames
+    ), f"latent_slice must be within [0, {num_latent_frames}], got {latent_slice}"
+    return latent_start, latent_end
+
+
+def _average_temporal_intrinsics(
+    intrinsics: torch.Tensor,
+    skip_vae_check: bool,
+    *,
+    latent_slice: tuple[int, int] | None = None,
+    temporal_scale: int = 4,
+    pose_alignment: str = "mean",
+) -> torch.Tensor:
     num_frames = intrinsics.shape[0]
-    for i in range(1, num_frames, 4):
-        group = intrinsics[i : min(i + 4, num_frames)]
-        if skip_vae_check and group.shape[0] < 4:
-            group = torch.cat([group, group[-1:].expand(4 - group.shape[0], -1)], dim=0)
+    num_latent_frames = _latent_frame_count(num_frames, temporal_scale, skip_vae_check=skip_vae_check)
+    latent_start, latent_end = _normalize_latent_slice(latent_slice, num_latent_frames=num_latent_frames)
+
+    averaged = []
+    for latent_index in range(latent_start, latent_end):
+        raw_start, raw_end = _latent_index_raw_bounds(latent_index, num_frames, temporal_scale)
+        group = intrinsics[raw_start:raw_end]
+        if pose_alignment == "last":
+            averaged.append(group[-1])
+            continue
+        if skip_vae_check and group.shape[0] < temporal_scale:
+            group = torch.cat([group, group[-1:].expand(temporal_scale - group.shape[0], -1)], dim=0)
         averaged.append(group.mean(dim=0))
     return torch.stack(averaged)
+
+
+def _average_temporal_c2ws_ref(
+    c2ws_ref: torch.Tensor,
+    skip_vae_check: bool,
+    *,
+    latent_slice: tuple[int, int] | None = None,
+    temporal_scale: int = 4,
+    pose_alignment: str = "mean",
+) -> torch.Tensor:
+    num_frames = c2ws_ref.shape[0]
+    num_latent_frames = _latent_frame_count(num_frames, temporal_scale, skip_vae_check=skip_vae_check)
+    latent_start, latent_end = _normalize_latent_slice(latent_slice, num_latent_frames=num_latent_frames)
+
+    averaged_c2ws_ref = []
+    for latent_index in range(latent_start, latent_end):
+        raw_start, raw_end = _latent_index_raw_bounds(latent_index, num_frames, temporal_scale)
+        group = c2ws_ref[raw_start:raw_end]
+        if pose_alignment == "last":
+            averaged_c2ws_ref.append(group[-1])
+            continue
+        if skip_vae_check and group.shape[0] < temporal_scale:
+            padding = group[-1:].expand(temporal_scale - group.shape[0], -1, -1)
+            group = torch.cat([group, padding], dim=0)
+
+        if group.shape[0] == 1:
+            averaged_c2ws_ref.append(group[0])
+            continue
+
+        averaged_c2w = torch.eye(4, dtype=c2ws_ref.dtype, device=c2ws_ref.device)
+        averaged_rotation = R.from_matrix(group[:, :3, :3].detach().cpu().numpy()).mean().as_matrix()
+        averaged_c2w[:3, :3] = torch.as_tensor(averaged_rotation, dtype=c2ws_ref.dtype, device=c2ws_ref.device)
+        averaged_c2w[:3, 3] = group[:, :3, 3].mean(dim=0)
+        averaged_c2ws_ref.append(averaged_c2w)
+    return torch.stack(averaged_c2ws_ref)
 
 
 def _intrinsics_to_K(intrinsics: torch.Tensor) -> torch.Tensor:
@@ -489,35 +614,51 @@ def _intrinsics_to_K(intrinsics: torch.Tensor) -> torch.Tensor:
     return K
 
 
+@functools.lru_cache(maxsize=8)
+def _image_points_for_resolution(image_height: int, image_width: int) -> torch.Tensor:
+    u = np.tile(np.arange(image_width), image_height)
+    v = np.arange(image_height).repeat(image_width)
+    pixel_coords = torch.tensor(np.stack([u, v], axis=1), dtype=torch.int32)
+    return pixels_to_image_points(pixel_coords)
+
+
 def _camera_rays_for_intrinsics(
     intrinsics: torch.Tensor,
     averaged_c2ws_ref: torch.Tensor,
     image_height: int,
     image_width: int,
 ) -> torch.Tensor:
-    u = np.tile(np.arange(image_width), image_height)
-    v = np.arange(image_height).repeat(image_width)
-    pixel_coords = torch.tensor(np.stack([u, v], axis=1), dtype=torch.int32)
-    image_points = pixels_to_image_points(pixel_coords)
+    image_points = _image_points_for_resolution(image_height, image_width)
 
+    # Intrinsics rows are usually identical across frames, so run the iterative
+    # per-pixel undistortion solve once per distinct row and reuse the result.
     rays_d_cam = []
-    for fx_norm, fy_norm, cx_norm, cy_norm, k1, k2, p1, p2 in intrinsics.detach().cpu().tolist():
-        params = OpenCVPinholeCameraModelParameters(
-            resolution=np.array([image_width, image_height]).astype(np.int64),
-            shutter_type=ShutterType.GLOBAL,
-            principal_point=np.array([cx_norm * image_width, cy_norm * image_height]).astype(np.float32),
-            focal_length=np.array([fx_norm * image_width, fy_norm * image_height]).astype(np.float32),
-            radial_coeffs=np.array([k1, k2, 0, 0, 0, 0]).astype(np.float32),
-            tangential_coeffs=np.array([p1, p2]).astype(np.float32),
-            thin_prism_coeffs=np.zeros((4,), dtype=np.float32),
-        )
-        rays_d_cam.append(torch.as_tensor(params._image_points_to_camera_rays_impl(image_points), dtype=torch.float32))
+    rays_by_row: dict[tuple[float, ...], torch.Tensor] = {}
+    for row in intrinsics.detach().cpu().tolist():
+        rays = rays_by_row.get(tuple(row))
+        if rays is None:
+            fx_norm, fy_norm, cx_norm, cy_norm, k1, k2, p1, p2 = row
+            params = OpenCVPinholeCameraModelParameters(
+                resolution=np.array([image_width, image_height]).astype(np.int64),
+                shutter_type=ShutterType.GLOBAL,
+                principal_point=np.array([cx_norm * image_width, cy_norm * image_height]).astype(np.float32),
+                focal_length=np.array([fx_norm * image_width, fy_norm * image_height]).astype(np.float32),
+                radial_coeffs=np.array([k1, k2, 0, 0, 0, 0]).astype(np.float32),
+                tangential_coeffs=np.array([p1, p2]).astype(np.float32),
+                thin_prism_coeffs=np.zeros((4,), dtype=np.float32),
+            )
+            rays = torch.as_tensor(params._image_points_to_camera_rays_impl(image_points), dtype=torch.float32)
+            rays_by_row[tuple(row)] = rays
+        rays_d_cam.append(rays)
     rays_d_cam = torch.stack(rays_d_cam)
     rays_d_cam = rays_d_cam.to(device=averaged_c2ws_ref.device, dtype=averaged_c2ws_ref.dtype)
     rays_d_ref = torch.bmm(rays_d_cam, averaged_c2ws_ref[:, :3, :3].transpose(1, 2))
     rays_o_ref = averaged_c2ws_ref[:, :3, 3].unsqueeze(1).expand(-1, rays_d_ref.shape[1], -1)
-    rays_dxo_ref = torch.linalg.cross(rays_o_ref, rays_d_ref)
-    return torch.cat([rays_dxo_ref, rays_d_ref], dim=-1).view(rays_d_ref.shape[0], image_height, image_width, 6)
+    # Plücker ray encoding with moment o×d. The channel order is (o×d, d), the
+    # reverse of the paper's (d, o×d). Released checkpoints were trained with
+    # this order, so it cannot change.
+    rays_oxd_ref = torch.linalg.cross(rays_o_ref, rays_d_ref)
+    return torch.cat([rays_oxd_ref, rays_d_ref], dim=-1).view(rays_d_ref.shape[0], image_height, image_width, 6)
 
 
 def compute_camera_conditioning(
@@ -530,24 +671,19 @@ def compute_camera_conditioning(
     skip_vae_check: bool = False,
     target_intrinsics: torch.Tensor | None = None,
     neighbor_intrinsics: torch.Tensor | None = None,
+    latent_slice: tuple[int, int] | None = None,
+    pose_alignment: str = "mean",
+    include_neighbor_rays: bool = False,
 ) -> dict[str, torch.Tensor]:
-    """
-    Compute camera conditioning (prope w2cs/Ks, neighbor w2cs/Ks, plucker rays).
+    """Build camera matrices and rays relative to the first target camera.
 
-    Args:
-        intrinsics: Default camera intrinsics used when per-frame intrinsics are not provided.
-        c2ws_world: (N, 4, 4) camera-to-world transforms for main frames.
-        neighbor_c2ws_world: (M, 4, 4) camera-to-world transforms for neighbor frames.
-        scale: Scale factor for translations.
-        image_height: Height of the images.
-        image_width: Width of the images.
-        skip_vae_check: If True, allow frame counts that don't satisfy 1 + 4*n.
-        target_intrinsics: Optional (N, 8) normalized per-frame intrinsics.
-        neighbor_intrinsics: Optional (M, 8) normalized per-neighbor intrinsics.
-
-    Returns:
-        Dict with w2cs, Ks, neighbor_w2cs, neighbor_Ks, camera_rays.
+    Lens rows are normalized [fx, fy, cx, cy, k1, k2, p1, p2] and preserve
+    per-image distortion. Cosmos3 also needs reference rays, which are not
+    temporally pooled or sliced. The origin stays fixed when slicing targets.
     """
+    assert (
+        pose_alignment in CAMERA_POSE_ALIGNMENTS
+    ), f"pose_alignment must be one of {CAMERA_POSE_ALIGNMENTS}, got {pose_alignment!r}"
     item = {}
 
     c2ws_world = c2ws_world.clone()
@@ -571,32 +707,27 @@ def compute_camera_conditioning(
 
     target_intrinsics = target_intrinsics.to(device=device, dtype=c2ws_world.dtype)
     neighbor_intrinsics = neighbor_intrinsics.to(device=device, dtype=c2ws_world.dtype)
+    # Scale reference-camera positions to match the targets, then express all cameras relative to the first target.
+    neighbor_c2ws_world[:, :3, 3] = neighbor_c2ws_world[:, :3, 3] * scale
     ref_w2c = invert_SE3(c2ws_world[0])
     c2ws_ref = ref_w2c @ c2ws_world
 
-    # Average camera poses in groups of 4 for VAE temporal compression.
-    averaged_c2ws_ref = [c2ws_ref[0]]
-    if not skip_vae_check:
-        assert (c2ws_ref.shape[0] - 1) % 4 == 0, f"Frames should be 1 + 4*n for VAE, got {c2ws_ref.shape[0]}"
-    num_frames = c2ws_ref.shape[0]
-    for i in range(1, num_frames, 4):
-        end_idx = min(i + 4, num_frames)
-        group = c2ws_ref[i:end_idx]
-        if skip_vae_check and group.shape[0] < 4:
-            padding = group[-1:].expand(4 - group.shape[0], -1, -1)
-            group = torch.cat([group, padding], dim=0)
-        averaged_c2w = torch.eye(4, dtype=c2ws_ref.dtype, device=c2ws_ref.device)
-        averaged_rotation = R.from_matrix(group[:, :3, :3].detach().cpu().numpy()).mean().as_matrix()
-        averaged_c2w[:3, :3] = torch.as_tensor(averaged_rotation, dtype=c2ws_ref.dtype, device=c2ws_ref.device)
-        averaged_c2w[:3, 3] = group[:, :3, 3].mean(dim=0)
-        averaged_c2ws_ref.append(averaged_c2w)
-    averaged_c2ws_ref = torch.stack(averaged_c2ws_ref)
-    averaged_target_intrinsics = _average_temporal_intrinsics(target_intrinsics, skip_vae_check)
+    averaged_c2ws_ref = _average_temporal_c2ws_ref(
+        c2ws_ref,
+        skip_vae_check,
+        latent_slice=latent_slice,
+        pose_alignment=pose_alignment,
+    )
+    averaged_target_intrinsics = _average_temporal_intrinsics(
+        target_intrinsics,
+        skip_vae_check,
+        latent_slice=latent_slice,
+        pose_alignment=pose_alignment,
+    )
 
     item["w2cs"] = invert_SE3(averaged_c2ws_ref)
     item["Ks"] = _intrinsics_to_K(averaged_target_intrinsics)
 
-    neighbor_c2ws_world[:, :3, 3] = neighbor_c2ws_world[:, :3, 3] * scale
     neighbor_c2ws_ref = ref_w2c @ neighbor_c2ws_world
     item["neighbor_w2cs"] = invert_SE3(neighbor_c2ws_ref)
     item["neighbor_Ks"] = _intrinsics_to_K(neighbor_intrinsics)
@@ -607,6 +738,12 @@ def compute_camera_conditioning(
         image_height,
         image_width,
     )
+    if include_neighbor_rays:
+        item["neighbor_camera_rays"] = (
+            _camera_rays_for_intrinsics(neighbor_intrinsics, neighbor_c2ws_ref, image_height, image_width)
+            if neighbor_intrinsics.shape[0] > 0
+            else neighbor_c2ws_ref.new_empty((0, image_height, image_width, 6))
+        )
 
     return item
 
@@ -618,14 +755,16 @@ def compute_camera_rays(
     scale: float,
     image_shape: tuple[int, int],  # (H, W)
     skip_vae_check: bool = False,
+    pose_alignment: str = "mean",
+    include_neighbor_rays: bool = False,
 ) -> dict[str, Any]:
-    """Convenience wrapper that builds c2w tensors and per-frame intrinsics from transforms metadata."""
+    """Read camera poses and lens parameters from the scene record, then build the camera inputs."""
     H, W = image_shape
     frames = transforms["frames"]
     c2ws_world = torch.stack([torch.FloatTensor(frames[idx]["transform_matrix"]) for idx in frame_indices])
     neighbor_c2ws_world = torch.stack([torch.FloatTensor(frames[idx]["transform_matrix"]) for idx in neighbor_indices])
-    target_intrinsics = torch.stack([_frame_intrinsics(transforms, frames[idx]) for idx in frame_indices])
-    neighbor_intrinsics = torch.stack([_frame_intrinsics(transforms, frames[idx]) for idx in neighbor_indices])
+    target_intrinsics = frame_intrinsics_for(transforms, frame_indices)
+    neighbor_intrinsics = frame_intrinsics_for(transforms, neighbor_indices)
     return compute_camera_conditioning(
         intrinsics=transforms,
         c2ws_world=c2ws_world,
@@ -636,6 +775,8 @@ def compute_camera_rays(
         skip_vae_check=skip_vae_check,
         target_intrinsics=target_intrinsics,
         neighbor_intrinsics=neighbor_intrinsics,
+        pose_alignment=pose_alignment,
+        include_neighbor_rays=include_neighbor_rays,
     )
 
 
@@ -656,6 +797,9 @@ def visualize_inference_pairs(
         title: Custom title for the plot
         selection_mode: Train selection mode for title
     """
+    # Imported here so training and dataloader workers never import matplotlib.
+    import matplotlib.pyplot as plt
+
     if output_path:
         output_path = Path(output_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)

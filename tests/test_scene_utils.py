@@ -1,7 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-import importlib.util
 import json
 import tempfile
 import unittest
@@ -16,7 +15,6 @@ from data_processing.run_sparse_reconstruction import run_scene
 from data_processing.scene_utils import (
     discover_scene_zips,
     downsampled_image_path,
-    extract_zip,
     load_scene_transforms_from_dir,
     load_scene_transforms_from_zip,
     load_source_scene_transforms,
@@ -42,7 +40,7 @@ def write_zip(path: Path, members: dict[str, str]) -> None:
             zf.writestr(member, contents)
 
 
-class ExtractZipTests(unittest.TestCase):
+class SceneUtilsTests(unittest.TestCase):
     def test_downsampled_image_path_rewrites_only_path_component(self) -> None:
         self.assertEqual(downsampled_image_path("images/frame_00001.png", 4), "images_4/frame_00001.png")
         self.assertEqual(downsampled_image_path("./scene/images/frame.png", 8), "scene/images_8/frame.png")
@@ -57,37 +55,6 @@ class ExtractZipTests(unittest.TestCase):
         self.assertEqual(image_dir_for_scene(Path("/scene"), 4.0), Path("/scene/images_4"))
         with self.assertRaises(AssertionError):
             image_dir_for_scene(Path("/scene"), 4.5)
-
-    def test_overlays_same_stem_archive_when_requested(self) -> None:
-        work_root = Path(self.enterContext(tempfile.TemporaryDirectory()))
-        scene_zip = work_root / "dl3dv" / "scene_a.zip"
-        colmap_zip = work_root / "colmap" / "scene_a.zip"
-        work_dir = work_root / "work"
-
-        write_zip(scene_zip, {"scene_a/images/00000.png": "image"})
-        write_zip(colmap_zip, {"scene_a/colmap/sparse/0/images.bin": "colmap"})
-
-        scene_dir = extract_zip(scene_zip, work_dir)
-        overlay_dir = extract_zip(colmap_zip, work_dir, skip_existing_scene_dir=False)
-
-        self.assertEqual(scene_dir, work_dir / "scene_a")
-        self.assertEqual(overlay_dir, work_dir / "scene_a")
-        self.assertEqual((work_dir / "scene_a/images/00000.png").read_text(), "image")
-        self.assertEqual((work_dir / "scene_a/colmap/sparse/0/images.bin").read_text(), "colmap")
-
-    def test_skips_existing_scene_dir_by_default(self) -> None:
-        work_root = Path(self.enterContext(tempfile.TemporaryDirectory()))
-        first_zip = work_root / "first" / "scene_a.zip"
-        second_zip = work_root / "second" / "scene_a.zip"
-        work_dir = work_root / "work"
-
-        write_zip(first_zip, {"scene_a/value.txt": "first"})
-        write_zip(second_zip, {"scene_a/value.txt": "second"})
-
-        extract_zip(first_zip, work_dir)
-        extract_zip(second_zip, work_dir)
-
-        self.assertEqual((work_dir / "scene_a/value.txt").read_text(), "first")
 
     def test_safe_extractall_rejects_path_traversal(self) -> None:
         work_dir = Path(self.enterContext(tempfile.TemporaryDirectory()))
@@ -231,7 +198,6 @@ class ExtractZipTests(unittest.TestCase):
 
 
 class ReconstructionWorkflowTests(unittest.TestCase):
-    @unittest.skipUnless(importlib.util.find_spec("numpy"), "numpy is required by half_covisibility_sampling.py")
     def test_half_covisibility_writes_json_outputs(self) -> None:
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         scene_dir = root / "scene_a"
@@ -369,6 +335,7 @@ class ReconstructionWorkflowTests(unittest.TestCase):
         )
 
         with (
+            patch("data_processing.run_sparse_reconstruction.locate_colmap_archive"),
             patch("data_processing.run_sparse_reconstruction.write_half_covisibility_sampled_indices") as sample_mock,
             patch("data_processing.run_sparse_reconstruction.run_one_reconstruction") as run_one_mock,
         ):

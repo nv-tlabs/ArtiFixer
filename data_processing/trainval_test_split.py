@@ -15,7 +15,12 @@ import h5py
 import numpy as np
 from tqdm import tqdm
 
-from data_processing.scene_utils import downsampled_image_path, load_source_scene_transforms, scene_zip_member
+from data_processing.scene_utils import (
+    downsampled_image_path,
+    load_source_scene_transforms,
+    read_scene_list,
+    scene_zip_member,
+)
 from data_processing.sparse_recon.workflow import RECONSTRUCTION_SUBDIR_PREFIX
 from model_training.data.reconstruction_path import parse_reconstruction_hdf5_path
 from model_training.utils.video_io import decode_video_frame_count
@@ -29,20 +34,18 @@ def notify(message: str) -> None:
     print(message, flush=True)
 
 
-def dl3dv_subdir_from_reconstruction_subdir(subdir: str) -> str:
-    if not is_reconstruction_subdir(subdir):
-        raise ValueError(
-            f"Unexpected reconstruction subdir {subdir!r}; expected prefix {RECONSTRUCTION_SUBDIR_PREFIX!r}"
-        )
-    return subdir.removeprefix(RECONSTRUCTION_SUBDIR_PREFIX)
+def dl3dv_subdir_from_reconstruction_subdir(subdir: str, prefix: str) -> str:
+    if not is_reconstruction_subdir(subdir, prefix):
+        raise ValueError(f"Unexpected reconstruction subdir {subdir!r}; expected prefix {prefix!r}")
+    return subdir.removeprefix(prefix)
 
 
-def dl3dv_zip_path(dl3dv_dir: Path, scene_id: str, subdir: str) -> Path:
-    return dl3dv_dir / dl3dv_subdir_from_reconstruction_subdir(subdir) / f"{scene_id}.zip"
+def dl3dv_zip_path(dl3dv_dir: Path, scene_id: str, subdir: str, prefix: str) -> Path:
+    return dl3dv_dir / dl3dv_subdir_from_reconstruction_subdir(subdir, prefix) / f"{scene_id}.zip"
 
 
-def is_reconstruction_subdir(subdir: str) -> bool:
-    return subdir.startswith(RECONSTRUCTION_SUBDIR_PREFIX)
+def is_reconstruction_subdir(subdir: str, prefix: str) -> bool:
+    return subdir.startswith(prefix)
 
 
 def invert_se3(transforms: np.ndarray) -> np.ndarray:
@@ -55,8 +58,8 @@ def invert_se3(transforms: np.ndarray) -> np.ndarray:
     return out
 
 
-def load_source_transforms(dl3dv_dir: Path, scene_id: str, subdir: str) -> tuple[dict, str]:
-    return load_source_scene_transforms(dl3dv_dir, dl3dv_subdir_from_reconstruction_subdir(subdir), scene_id)
+def load_source_transforms(dl3dv_dir: Path, scene_id: str, subdir: str, prefix: str) -> tuple[dict, str]:
+    return load_source_scene_transforms(dl3dv_dir, dl3dv_subdir_from_reconstruction_subdir(subdir, prefix), scene_id)
 
 
 def validate_scene_geometry(scene_id: str, transforms: dict, zip_path: str, recons: list[dict]) -> dict | None:
@@ -170,14 +173,16 @@ def validate_reconstruction_payload(
     return None, frame_count, selected_indices
 
 
-def validate_source_scene(dl3dv_dir: Path, scene_id: str, subdir: str) -> tuple[dict | None, dict | None]:
+def validate_source_scene(
+    dl3dv_dir: Path, scene_id: str, subdir: str, reconstruction_subdir_prefix: str
+) -> tuple[dict | None, dict | None]:
     """Return source-data issue and loaded transforms if the DL3DV zip is loader-compatible."""
-    source_subdir = dl3dv_subdir_from_reconstruction_subdir(subdir)
-    zip_path = dl3dv_zip_path(dl3dv_dir, scene_id, subdir)
+    source_subdir = dl3dv_subdir_from_reconstruction_subdir(subdir, reconstruction_subdir_prefix)
+    zip_path = dl3dv_zip_path(dl3dv_dir, scene_id, subdir, reconstruction_subdir_prefix)
     context = {"scene_id": scene_id, "subdir": source_subdir, "zip_path": str(zip_path)}
 
     try:
-        transforms, prefix = load_source_transforms(dl3dv_dir, scene_id, subdir)
+        transforms, prefix = load_source_transforms(dl3dv_dir, scene_id, subdir, reconstruction_subdir_prefix)
         for key in ("cx", "cy", "fl_x", "fl_y", "w", "h"):
             if key not in transforms:
                 return {**context, "reason": "intrinsics_missing", "member": key}, None
@@ -232,7 +237,8 @@ def process_scene(
     dl3dv_dir: Path,
     required_splits: set[int],
     decode_reconstruction_videos: bool,
-) -> tuple[str, list[dict], list[dict], dict | None, dict | None]:
+    reconstruction_subdir_prefix: str,
+) -> tuple[str, list[dict], list[dict], dict | None, dict | None, tuple[int, int] | None]:
     """Scan one scene's h5 reconstructions. Missing-scale, zero-scale,
     unreasonably-large-scale, and unreadable files are NOT silently dropped —
     BAD_SCENE_IDS was filtered out before this point, so any file with those
@@ -240,9 +246,12 @@ def process_scene(
     files as ``bad_entries`` and the caller raises with the full list after
     scanning every scene, so a single regen surfaces every problem at once.
 
-    Returns ``(scene_id, per_scene_data, bad_entries, source_issue, geometry_issue)``."""
+    Returns ``(scene_id, per_scene_data, bad_entries, source_issue, geometry_issue,
+    source_resolution)`` where ``source_resolution`` is the scene's transforms
+    ``(w, h)`` when the source zip was validated, else None."""
     source_issue = None
     geometry_issue = None
+    source_resolution = None
 
     scene_path = os.path.join(data_path, subdir, scene_id)
     by_key: dict[tuple[str, int], dict] = {}
@@ -321,7 +330,7 @@ def process_scene(
         candidate = {
             "scene_half": scene_half,
             "num_selected_indices": num_selected_indices,
-            "subdir": dl3dv_subdir_from_reconstruction_subdir(subdir),
+            "subdir": dl3dv_subdir_from_reconstruction_subdir(subdir, reconstruction_subdir_prefix),
             "scale": scale,
             "hdf5_path": hdf5_path,
         }
@@ -342,10 +351,11 @@ def process_scene(
             )
 
     if any(recon["num_selected_indices"] in required_splits for recon in by_key.values()):
-        source_issue, transforms = validate_source_scene(dl3dv_dir, scene_id, subdir)
-        source_zip_path = str(dl3dv_zip_path(dl3dv_dir, scene_id, subdir))
+        source_issue, transforms = validate_source_scene(dl3dv_dir, scene_id, subdir, reconstruction_subdir_prefix)
+        source_zip_path = str(dl3dv_zip_path(dl3dv_dir, scene_id, subdir, reconstruction_subdir_prefix))
         required_recons = [recon for recon in by_key.values() if recon["num_selected_indices"] in required_splits]
         if source_issue is None:
+            source_resolution = (int(transforms["w"]), int(transforms["h"]))
             source_frame_count = len(transforms["frames"])
             for recon in required_recons:
                 hdf5_path = recon["hdf5_path"]
@@ -382,7 +392,7 @@ def process_scene(
             except Exception as e:
                 geometry_issue = {"scene_id": scene_id, "reason": "geometry_read_error", "error": repr(e)}
 
-    return scene_id, list(by_key.values()), bad_entries, source_issue, geometry_issue
+    return scene_id, list(by_key.values()), bad_entries, source_issue, geometry_issue, source_resolution
 
 
 def raise_for_source_bad_entries(source_bad_entries: list[dict]) -> None:
@@ -433,20 +443,11 @@ def format_entry_details(entry: dict) -> str:
     return " ".join(f"{key}={entry[key]}" for key in detail_keys if key in entry)
 
 
-def read_scene_ids(path: Path) -> set[str]:
-    scene_ids: set[str] = set()
-    for line in path.read_text().splitlines():
-        line = line.strip()
-        if line and not line.startswith("#"):
-            scene_ids.add(line)
-    return scene_ids
-
-
 def load_test_scenes() -> set[str]:
     repo_root = Path(__file__).resolve().parents[1]
     test_scenes: set[str] = set()
     for name in ("dl3dv_benchmark_ours_test_scenes.txt", "dl3dv_benchmark_difix_test_scenes.txt"):
-        test_scenes.update(read_scene_ids(repo_root / "data_processing" / name))
+        test_scenes.update(read_scene_list(repo_root / "data_processing" / name))
     return test_scenes
 
 
@@ -486,7 +487,7 @@ def _resolve_max_workers(requested: int | None, num_scenes: int) -> int:
     return max(1, min(cpu_count, num_scenes))
 
 
-if __name__ == "__main__":
+def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--data_path", type=str, required=True, help="Root directory of artifixer reconstructions")
     parser.add_argument("--output_root", type=str, required=True, help="Directory to write trainval_test_split.json")
@@ -518,6 +519,28 @@ if __name__ == "__main__":
             "counts against the DL3DV source scene. This is comprehensive but much slower than schema-only checks."
         ),
     )
+    parser.add_argument(
+        "--reconstruction_subdir_prefix",
+        type=str,
+        default=RECONSTRUCTION_SUBDIR_PREFIX,
+        help=(
+            "Directory-name prefix of the reconstruction subdirs under --data_path; the DL3DV source subdir "
+            "is the remainder after the prefix."
+        ),
+    )
+    parser.add_argument(
+        "--trainval_image_resolution",
+        type=int,
+        nargs=2,
+        metavar=("WIDTH", "HEIGHT"),
+        default=None,
+        help=(
+            "Keep only trainval scenes whose training images are exactly this size (the renders use the 4x "
+            "downsampled DL3DV images, so this matches scenes with transforms w/h of 4*WIDTH x 4*HEIGHT). "
+            "Scenes at other resolutions are dropped from trainval with a printed summary; the test split is "
+            "never filtered. Training gathers residual tensors across ranks, which needs one uniform resolution."
+        ),
+    )
     args = parser.parse_args()
 
     test_scenes = load_test_scenes()
@@ -527,7 +550,7 @@ if __name__ == "__main__":
     skipped_bad_scenes = 0
     skipped_non_reconstruction_subdirs = 0
     for subdir in sorted(os.listdir(args.data_path)):
-        if not is_reconstruction_subdir(subdir):
+        if not is_reconstruction_subdir(subdir, args.reconstruction_subdir_prefix):
             skipped_non_reconstruction_subdirs += 1
             continue
         subdir_path = os.path.join(args.data_path, subdir)
@@ -550,6 +573,11 @@ if __name__ == "__main__":
 
     required = sorted(set(args.required_splits))
     required_set = set(required)
+    target_source_resolution = None
+    if args.trainval_image_resolution is not None:
+        target_source_resolution = (4 * args.trainval_image_resolution[0], 4 * args.trainval_image_resolution[1])
+    source_resolution_counts: dict[tuple[int, int], int] = defaultdict(int)
+    excluded_trainval_resolution_counts: dict[tuple[int, int], int] = defaultdict(int)
     all_bad_entries: list[dict] = []
     source_bad_entries_by_scene_id: dict[str, dict] = {}
     geometry_bad_entries_by_scene_id: dict[str, dict] = {}
@@ -568,19 +596,46 @@ if __name__ == "__main__":
                 args.dl3dv_dir,
                 required_set,
                 args.decode_reconstruction_videos,
+                args.reconstruction_subdir_prefix,
             )
             for sid, sub in scene_ids
         ]
         for future in tqdm(as_completed(futures), total=len(futures), desc="Scanning scenes"):
-            scene_id, per_scene_data, bad_entries, source_issue, geometry_issue = future.result()
+            scene_id, per_scene_data, bad_entries, source_issue, geometry_issue, source_resolution = future.result()
             all_bad_entries.extend(bad_entries)
             if source_issue is not None:
                 source_bad_entries_by_scene_id[scene_id] = source_issue
             if geometry_issue is not None:
                 geometry_bad_entries_by_scene_id[scene_id] = geometry_issue
+            if source_resolution is not None:
+                source_resolution_counts[source_resolution] += 1
+            if (
+                target_source_resolution is not None
+                and source_resolution is not None
+                and source_resolution != target_source_resolution
+                and scene_id not in test_scenes
+            ):
+                excluded_trainval_resolution_counts[source_resolution] += 1
+                continue
             for recon in per_scene_data:
                 bucket = "test" if scene_id in test_scenes else "trainval"
                 split_data[bucket][scene_id].append(recon)
+
+    if source_resolution_counts:
+        formatted = ", ".join(
+            f"{w}x{h}: {count}" for (w, h), count in sorted(source_resolution_counts.items(), key=lambda kv: -kv[1])
+        )
+        print(f"Source scene resolutions: {formatted}")
+    if excluded_trainval_resolution_counts:
+        formatted = ", ".join(
+            f"{w}x{h}: {count}"
+            for (w, h), count in sorted(excluded_trainval_resolution_counts.items(), key=lambda kv: -kv[1])
+        )
+        total_excluded = sum(excluded_trainval_resolution_counts.values())
+        print(
+            f"Excluded {total_excluded} trainval scene(s) whose source resolution is not "
+            f"{target_source_resolution[0]}x{target_source_resolution[1]}: {formatted}"
+        )
 
     # Only raise on bad entries whose num_selected_indices is in required_splits — those are the
     # files that the training/eval pipeline actually needs. Out-of-required bad entries are logged
@@ -624,12 +679,9 @@ if __name__ == "__main__":
                 for r in recons:
                     half = r["scene_half"]
                     n = int(r["num_selected_indices"])
+                    # process_scene already rejected duplicate (half, n) files and invalid scales.
                     if n not in required_set:
                         continue
-                    if n in by_half[half]:
-                        raise ValueError(
-                            f"Duplicate reconstruction for ({scene_id}, half={half}, num_selected_indices={n})"
-                        )
                     by_half[half][n] = r
                 for half, by_n in by_half.items():
                     missing = required_set - by_n.keys()
@@ -639,13 +691,6 @@ if __name__ == "__main__":
                             f"has {sorted(by_n)}"
                         )
                     scales_required = {n: by_n[n]["scale"] for n in required}
-                    invalid = {n: s for n, s in scales_required.items() if not (math.isfinite(s) and s > 0)}
-                    if invalid:
-                        raise ValueError(
-                            f"({scene_id}, half={half}) has non-finite or non-positive scale(s): "
-                            f"{invalid}. Full map: {scales_required}. Add to BAD_SCENE_IDS or re-run "
-                            "reconstruction."
-                        )
                     canonical = next(iter(scales_required.values()))
                     # rel_tol=1e-3 (0.1%) tolerates small numerical noise from independent
                     # reconstruction runs (observed drift is ~5e-5) while still catching
@@ -689,3 +734,7 @@ if __name__ == "__main__":
         f"Trainval: {trainval_recon_count} reconstructions ({len(split_data['trainval'])} scenes). "
         f"Saved to {output_path}"
     )
+
+
+if __name__ == "__main__":
+    main()

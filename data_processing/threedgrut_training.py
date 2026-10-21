@@ -9,9 +9,7 @@ from hydra import compose, initialize_config_dir
 from omegaconf import OmegaConf
 from threedgrut.trainer import Trainer3DGRUT
 
-DEFAULT_THREEDGRUT_CONFIG_DIR = (
-    Path(__file__).resolve().parents[1] / "thirdparty" / "3DGRUT-ArtiFixer" / "configs"
-)
+DEFAULT_THREEDGRUT_CONFIG_DIR = Path(__file__).resolve().parents[1] / "thirdparty" / "3DGRUT-ArtiFixer" / "configs"
 
 
 def register_3dgrut_resolvers() -> None:

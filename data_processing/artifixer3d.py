@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import shutil
 import struct
 from dataclasses import dataclass
 from pathlib import Path
@@ -16,7 +15,7 @@ from pathlib import Path
 import numpy as np
 from PIL import Image as PILImage
 from scipy.spatial.transform import Rotation
-from threedgrut.datasets.utils import CAMERA_MODEL_NAMES, Camera
+from threedgrut.datasets.utils import Camera
 from threedgrut.datasets.utils import Image as ColmapImage
 from threedgrut.datasets.utils import read_colmap_extrinsics_binary, read_colmap_intrinsics_binary
 
@@ -28,11 +27,28 @@ from data_processing.camera_trajectories import (
     trajectory_frame_count,
     write_json,
 )
+from data_processing.prep_utils import (
+    colmap_params_to_opencv,
+    parse_phases,
+    reset_directory,
+    write_colmap_cameras,
+    write_colmap_images,
+)
+from data_processing.reconstructed_colmap_split import (
+    read_split_scenes,
+    resolve_has_gt,
+    resolve_optional_path,
+    resolve_required_number,
+    resolve_required_path,
+    split_entry,
+    write_split,
+)
 from data_processing.render_3dgrut_colmap import (
     render_3dgrut_colmap,
     render_outputs_complete,
     selected_indices_for_render,
 )
+from model_training.utils.video_io import atomic_output_path
 
 ARTIFIXER3D_EXPERIMENT = "artifixer3d"
 
@@ -60,7 +76,9 @@ class PreparedScene:
     colmap_dir: Path
     # Caption embedding file carried into ArtiFixer3D+ inference metadata.
     prompt_path: Path
-    # Metric scale expected by inference; copied from the prepared split.
+    # Geometry scale expected by ArtiFixer inference; copied from the prepared
+    # split, where it was computed as (reconstruction-units-to-meters factor)
+    # x the fixed training conditioning constant.
     camera_scale: float
     # Preserve generated-only metadata as has_gt=False for ArtiFixer3D+ inference.
     has_gt: bool
@@ -94,40 +112,6 @@ class Artifixer3DPaths:
     artifixer3d_plus_inference_split_path: Path
 
 
-def resolve_split_path(split_root: Path, value: str) -> Path:
-    """Resolve split metadata paths relative to the split file so splits stay relocatable."""
-    path = Path(value)
-    return path if path.is_absolute() else split_root / path
-
-
-def resolve_metadata_path(split_root: Path, metadata: dict[str, object], field: str) -> Path:
-    """Read a required path field from split metadata and fail before later phases guess."""
-    assert field in metadata, f"Prepared scene is missing required field {field!r}"
-    value = metadata[field]
-    assert isinstance(value, str), f"Prepared scene field {field!r} must be a string path, got {value!r}"
-    return resolve_split_path(split_root, value)
-
-
-def resolve_metadata_number(metadata: dict[str, object], field: str) -> float:
-    """Read required numeric metadata from prepared split metadata."""
-    assert field in metadata, f"Prepared scene is missing required field {field!r}"
-    value = metadata[field]
-    assert isinstance(value, int | float) and not isinstance(
-        value, bool
-    ), f"Prepared scene field {field!r} must be a number, got {value!r}"
-    return float(value)
-
-
-def path_for_split(split_path: Path, path: Path) -> str:
-    """Store paths relative to the split when possible so outputs move with the scene root."""
-    split_root = split_path.parent.resolve()
-    path = path.resolve()
-    try:
-        return path.relative_to(split_root).as_posix()
-    except ValueError:
-        return str(path)
-
-
 def load_json_list(path: Path) -> list[int]:
     """Read selected-index JSON files and assert they contain integer frame ids."""
     values = json.loads(path.read_text())
@@ -150,37 +134,26 @@ def load_prepared_scene(scene_root: Path, split_path: Path | None, scene_id: str
     """Resolve and validate the prepared split into the contract ArtiFixer3D consumes."""
     scene_root = scene_root.resolve()
     split_path = (split_path or scene_root / "split.json").resolve()
-    split_data = json.loads(split_path.read_text())["test"]
-    assert isinstance(split_data, dict), f"{split_path} test split must be a mapping"
+    split_data = read_split_scenes(split_path)
 
     if scene_id is None:
         assert len(split_data) == 1, f"--scene_id is required when {split_path} contains {len(split_data)} scenes"
         scene_id = next(iter(split_data))
 
     metadata = split_data[scene_id]
-    assert isinstance(metadata, dict), f"Scene {scene_id!r} metadata must be a mapping"
     split_root = split_path.parent
 
-    transforms_path = resolve_metadata_path(split_root, metadata, "transforms_path")
-    colmap_dir = resolve_metadata_path(split_root, metadata, "image_root")
-    selected_indices_path = resolve_metadata_path(split_root, metadata, "selected_indices_path")
-    target_indices_path = (
-        resolve_metadata_path(split_root, metadata, "target_indices_path")
-        if "target_indices_path" in metadata
-        else None
-    )
-    prompt_path = resolve_metadata_path(split_root, metadata, "prompt_path")
-    reconstruction_checkpoint = (
-        resolve_metadata_path(split_root, metadata, "reconstruction_checkpoint")
-        if "reconstruction_checkpoint" in metadata
-        else None
-    )
-    has_gt = metadata.get("has_gt", True)
-    assert isinstance(has_gt, bool), f"Scene {scene_id!r} has non-boolean has_gt metadata: {has_gt!r}"
+    transforms_path = resolve_required_path(split_root, metadata, "transforms_path")
+    colmap_dir = resolve_required_path(split_root, metadata, "image_root")
+    selected_indices_path = resolve_required_path(split_root, metadata, "selected_indices_path")
+    target_indices_path = resolve_optional_path(split_root, metadata, "target_indices_path")
+    prompt_path = resolve_required_path(split_root, metadata, "prompt_path")
+    reconstruction_checkpoint = resolve_optional_path(split_root, metadata, "reconstruction_checkpoint")
+    has_gt = resolve_has_gt(scene_id, metadata)
 
     selected_indices = load_json_list(selected_indices_path)
     frame_count = read_frame_count(transforms_path)
-    camera_scale = resolve_metadata_number(metadata, "camera_scale")
+    camera_scale = resolve_required_number(metadata, "camera_scale")
 
     required_paths = (transforms_path, colmap_dir, selected_indices_path, prompt_path)
     if target_indices_path is not None:
@@ -245,6 +218,15 @@ def generated_frame_indices(scene: PreparedScene) -> list[int]:
     return [index for index in range(scene.frame_count) if index not in selected]
 
 
+def require_frames(directory: Path, indices: list[int], description: str) -> None:
+    """Raise FileNotFoundError naming up to 10 of the missing frame PNGs."""
+    missing = [index for index in indices if not (directory / f"{index:05d}.png").is_file()]
+    if missing:
+        preview = ", ".join(f"{index:05d}.png" for index in missing[:10])
+        suffix = "" if len(missing) <= 10 else f", ... ({len(missing)} missing)"
+        raise FileNotFoundError(f"Missing {description} in {directory}: {preview}{suffix}")
+
+
 def validate_artifixer_frames(scene: PreparedScene, artifixer_frames_dir: Path) -> None:
     """Fail before training if any required ArtiFixer prediction PNG is missing."""
     artifixer_frames_dir = artifixer_frames_dir.resolve()
@@ -256,20 +238,7 @@ def validate_artifixer_frames(scene: PreparedScene, artifixer_frames_dir: Path) 
         "ArtiFixer3D needs at least one generated/predicted frame. "
         "The prepared selected_indices cover every frame, so there is nothing to distill."
     )
-
-    missing = [index for index in generated_indices if not (artifixer_frames_dir / f"{index:05d}.png").is_file()]
-    if missing:
-        preview = ", ".join(f"{index:05d}.png" for index in missing[:10])
-        suffix = "" if len(missing) <= 10 else f", ... ({len(missing)} missing)"
-        raise FileNotFoundError(f"Missing ArtiFixer prediction frames in {artifixer_frames_dir}: {preview}{suffix}")
-
-
-def reset_directory(path: Path) -> None:
-    """Replace materialized inputs explicitly and reject symlinks before deletion."""
-    if path.exists():
-        assert path.is_dir() and not path.is_symlink(), f"Expected ArtiFixer3D output directory, got {path}"
-        shutil.rmtree(path)
-    path.mkdir(parents=True)
+    require_frames(artifixer_frames_dir, generated_indices, "ArtiFixer prediction frames")
 
 
 def source_frame_path(image_root: Path, file_path: str) -> Path:
@@ -317,28 +286,9 @@ def opencv_camera_from_mapping(camera_id: int, intrinsics: dict[str, object]) ->
 
 def opencv_camera_from_colmap(camera_id: int, camera: Camera, image_size: tuple[int, int]) -> Camera:
     """Convert source COLMAP cameras to the OPENCV Camera object written to cameras.bin."""
+    fx, fy, cx, cy, distortion = colmap_params_to_opencv(camera.model, camera.params)
     scale_x = image_size[0] / camera.width
     scale_y = image_size[1] / camera.height
-    if camera.model == "SIMPLE_PINHOLE":
-        fx = fy = camera.params[0]
-        cx, cy = camera.params[1:3]
-        distortion = (0.0, 0.0, 0.0, 0.0)
-    elif camera.model == "PINHOLE":
-        fx, fy, cx, cy = camera.params
-        distortion = (0.0, 0.0, 0.0, 0.0)
-    elif camera.model == "SIMPLE_RADIAL":
-        fx = fy = camera.params[0]
-        cx, cy, k1 = camera.params[1:4]
-        distortion = (k1, 0.0, 0.0, 0.0)
-    elif camera.model == "RADIAL":
-        fx = fy = camera.params[0]
-        cx, cy, k1, k2 = camera.params[1:5]
-        distortion = (k1, k2, 0.0, 0.0)
-    elif camera.model == "OPENCV":
-        fx, fy, cx, cy, *distortion = camera.params
-    else:
-        assert False, f"Unsupported COLMAP camera model for ArtiFixer3D distillation: {camera.model}"
-
     params = np.array(
         [fx * scale_x, fy * scale_y, cx * scale_x, cy * scale_y, *distortion],
         dtype=np.float64,
@@ -361,7 +311,9 @@ def colmap_qvec_from_rotation(rotation: np.ndarray) -> np.ndarray:
     return qvec / np.linalg.norm(qvec)
 
 
-def colmap_pose_from_transforms_frame(frame: dict[str, object], applied_transform: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+def colmap_pose_from_transforms_frame(
+    frame: dict[str, object], applied_transform: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
     """Convert a split transform_matrix to COLMAP OpenCV W2C qvec/tvec."""
     world_to_camera = opencv_world_to_camera_from_transforms_frame(frame, applied_transform)
     return colmap_qvec_from_rotation(world_to_camera[:3, :3]), world_to_camera[:3, 3]
@@ -392,8 +344,10 @@ def validate_selected_anchor_poses(
         candidate_qvec, candidate_tvec = colmap_pose_from_transforms_frame(frame, applied_transform)
         source_image = source_images[source_basename]
         rotation_error_degrees = (
-            colmap_rotation_from_qvec(candidate_qvec) * colmap_rotation_from_qvec(source_image.qvec).inv()
-        ).magnitude() * 180.0 / np.pi
+            (colmap_rotation_from_qvec(candidate_qvec) * colmap_rotation_from_qvec(source_image.qvec).inv()).magnitude()
+            * 180.0
+            / np.pi
+        )
         translation_error = float(np.linalg.norm(np.asarray(candidate_tvec) - np.asarray(source_image.tvec)))
         if (
             rotation_error_degrees > POSE_VALIDATION_ROTATION_TOLERANCE_DEGREES
@@ -406,36 +360,6 @@ def validate_selected_anchor_poses(
                 f"translation_error={translation_error:.6g}. "
                 "Regenerate the prepared split instead of reusing bad ArtiFixer3D outputs."
             )
-
-
-def write_colmap_cameras(path: Path, cameras: list[Camera]) -> None:
-    """Write cameras.bin because 3DGRUT trains from COLMAP binary inputs."""
-    opencv_model = CAMERA_MODEL_NAMES["OPENCV"]
-    with path.open("wb") as fid:
-        fid.write(struct.pack("<Q", len(cameras)))
-        for camera in cameras:
-            assert camera.model == opencv_model.model_name, f"Expected OPENCV camera {camera.id}, got {camera.model}"
-            assert len(camera.params) == 8, f"OPENCV camera {camera.id} must have 8 parameters"
-            fid.write(
-                struct.pack(
-                    "<iiQQ",
-                    camera.id,
-                    opencv_model.model_id,
-                    int(camera.width),
-                    int(camera.height),
-                )
-            )
-            fid.write(struct.pack("<" + "d" * len(camera.params), *camera.params))
-
-
-def write_colmap_images(path: Path, images: list[tuple[int, np.ndarray, np.ndarray, int, str]]) -> None:
-    """Write images.bin with poses and empty observations for distillation input."""
-    with path.open("wb") as fid:
-        fid.write(struct.pack("<Q", len(images)))
-        for image_id, qvec, tvec, camera_id, name in images:
-            fid.write(struct.pack("<idddddddi", image_id, *qvec, *tvec, camera_id))
-            fid.write(name.encode("utf-8") + b"\x00")
-            fid.write(struct.pack("<Q", 0))
 
 
 def copy_source_points3d(source_colmap_dir: Path, path: Path) -> None:
@@ -510,7 +434,17 @@ def materialize_distillation_input(
             qvec, tvec = colmap_pose_from_transforms_frame(frame, applied_transform)
         symlink_frame(source, image_dir / image_name)
 
-        colmap_images.append((index + 1, qvec, tvec, camera_id, image_name))
+        colmap_images.append(
+            ColmapImage(
+                id=index + 1,
+                qvec=qvec,
+                tvec=tvec,
+                camera_id=camera_id,
+                name=image_name,
+                xys=np.empty((0, 2), dtype=np.float64),
+                point3D_ids=np.empty(0, dtype=np.int64),
+            )
+        )
 
     write_colmap_cameras(sparse_dir / "cameras.bin", colmap_cameras)
     write_colmap_images(sparse_dir / "images.bin", colmap_images)
@@ -536,6 +470,16 @@ def train_artifixer3d(
         print(f"Skipping ArtiFixer3D distillation; found {checkpoint}", flush=True)
         return checkpoint, True
 
+    validate_artifixer_frames(scene, artifixer_frames_dir)
+    if base_checkpoint is not None:
+        base_checkpoint = base_checkpoint.resolve()
+        if not base_checkpoint.is_file():
+            raise FileNotFoundError(f"Missing initial 3DGRUT checkpoint: {base_checkpoint}")
+        if base_checkpoint.is_relative_to(checkpoint.parent.resolve()):
+            raise ValueError("Use a base checkpoint outside the ArtiFixer3D output checkpoint directory")
+    paths.artifixer3d_plus_inference_split_path.unlink(missing_ok=True)
+    reset_directory(paths.render_output_root)
+    reset_directory(checkpoint.parent)
     materialize_distillation_input(scene, paths, artifixer_frames_dir)
 
     overrides = [
@@ -551,8 +495,6 @@ def train_artifixer3d(
         f"checkpoint.iterations=[{steps}]",
     ]
     if base_checkpoint is not None:
-        base_checkpoint = base_checkpoint.resolve()
-        assert base_checkpoint.is_file(), f"Missing initial 3DGRUT checkpoint: {base_checkpoint}"
         overrides.append(f"resume={base_checkpoint}")
 
     threedgrut_training.train_3dgrut(config_name, overrides, threedgrut_training.DEFAULT_THREEDGRUT_CONFIG_DIR)
@@ -627,11 +569,7 @@ def require_render_outputs(
         directory = render_dir / name
         if not directory.is_dir():
             raise FileNotFoundError(f"Missing ArtiFixer3D render output directory: {directory}")
-        missing = [index for index in range(frame_count) if not (directory / f"{index:05d}.png").is_file()]
-        if missing:
-            preview = ", ".join(f"{index:05d}.png" for index in missing[:10])
-            suffix = "" if len(missing) <= 10 else f", ... ({len(missing)} missing)"
-            raise FileNotFoundError(f"Missing ArtiFixer3D {name} frames in {directory}: {preview}{suffix}")
+        require_frames(directory, list(range(frame_count)), f"ArtiFixer3D {name} frames")
 
 
 def write_artifixer3d_plus_inference_split(
@@ -652,41 +590,29 @@ def write_artifixer3d_plus_inference_split(
             f"Missing ArtiFixer3D checkpoint for ArtiFixer3D+ inference: {reconstruction_checkpoint}"
         )
 
-    selected_indices_path = render_dir / "selected_indices.json"
-    entry = {
-        "scene_id": scene.scene_id,
-        "transforms_path": path_for_split(output_split, scene.transforms_path),
-        "image_root": path_for_split(output_split, scene.colmap_dir),
-        "render_dir": path_for_split(output_split, render_dir / "renders"),
-        "opacity_dir": path_for_split(output_split, render_dir / "opacity"),
-        "selected_indices_path": path_for_split(output_split, selected_indices_path),
-        "prompt_path": path_for_split(output_split, scene.prompt_path),
-        "reconstruction_checkpoint": path_for_split(output_split, reconstruction_checkpoint),
-        "camera_scale": scene.camera_scale,
-    }
-    if scene.target_indices_path is not None:
-        entry["target_indices_path"] = path_for_split(output_split, scene.target_indices_path)
-    if not scene.has_gt:
-        entry["has_gt"] = False
-
-    write_json(output_split, {"test": {scene.scene_id: entry}})
+    entry = split_entry(
+        output_split,
+        scene.scene_id,
+        transforms_path=scene.transforms_path,
+        image_root=scene.colmap_dir,
+        render_dir=render_dir / "renders",
+        opacity_dir=render_dir / "opacity",
+        selected_indices_path=render_dir / "selected_indices.json",
+        prompt_path=scene.prompt_path,
+        reconstruction_checkpoint=reconstruction_checkpoint,
+        camera_scale=scene.camera_scale,
+        target_indices_path=scene.target_indices_path,
+        has_gt=scene.has_gt,
+    )
+    with atomic_output_path(output_split) as temporary:
+        write_split(temporary, scene.scene_id, entry)
     print(f"Wrote ArtiFixer3D+ inference split: {output_split}", flush=True)
     return output_split
 
 
-def parse_phases(value: str) -> set[str]:
-    """Validate comma-separated phase names so partial reruns are explicit."""
-    phases = {phase.strip() for phase in value.split(",") if phase.strip()}
-    valid = {"distill", "render", "prepare_artifixer3d_plus"}
-    unknown = phases - valid
-    assert not unknown, f"Unknown phases: {sorted(unknown)}"
-    assert phases, f"--phases must include at least one of {sorted(valid)}"
-    return phases
-
-
 def run_artifixer3d(args: argparse.Namespace) -> None:
     """Orchestrate requested ArtiFixer3D phases with reuse and replace semantics."""
-    phases = parse_phases(args.phases)
+    phases = parse_phases(args.phases, {"distill", "render", "prepare_artifixer3d_plus"})
     scene = load_prepared_scene(args.scene_root, args.split_path, args.scene_id)
     paths = artifixer3d_paths(
         scene, args.output_root, args.artifixer3d_plus_inference_split_path, args.artifixer3d_steps
@@ -720,6 +646,7 @@ def run_artifixer3d(args: argparse.Namespace) -> None:
 
     render_dir = paths.render_checkpoint_dir
     if "render" in phases:
+        paths.artifixer3d_plus_inference_split_path.unlink(missing_ok=True)
         render_dir = render_artifixer3d(
             scene,
             paths,

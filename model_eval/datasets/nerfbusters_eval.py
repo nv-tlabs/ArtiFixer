@@ -35,28 +35,34 @@ import torch
 from PIL import Image
 
 from data_processing.nerfbusters import nerfbusters_gt_relpath, nerfbusters_image_folder
+from model_eval.datasets.nerfbusters_split import nerfbusters_train_test_split
 from model_training.data.utils import (
     InferencePair,
     NeighborSelectionMode,
     compute_camera_rays,
     generate_inference_pairs,
-    load_encoded_prompt,
     load_indexed_frames,
-    resize_to_multiple_of_16,
+    load_prompt_payload_from_path,
+    resize_to_multiple,
 )
+from model_training.model_profiles import requires_reference_camera_rays
+from model_training.prompt_formats import caption_filename_for_format
+
 
 class NerfbustersEvalDataset(torch.utils.data.Dataset):
     """
     Dataset for evaluating on Nerfbusters benchmark scenes.
 
-    Expects reconstruction results in a directory structure:
+    Expects 3DGRUT reconstruction results in a directory structure:
         recon_results_dir/
             scene_name/
-                checkpoint_{step}/
-                    render/
-                        00000.png, 00001.png, ...
-                    opacity/
-                        00000.png, 00001.png, ...
+                {recon_experiment_name}/
+                    scene_name/
+                        ours_{step}/
+                            renders/
+                                00000.png, 00001.png, ...
+                            opacity/
+                                00000.png, 00001.png, ...
     """
 
     def __init__(
@@ -64,19 +70,22 @@ class NerfbustersEvalDataset(torch.utils.data.Dataset):
         nerfbusters_dir: Path,
         recon_results_dir: Path,
         captions_dir: Path,
-        num_frames: int | None,
         num_views: int,
+        recon_experiment_name: str,
         dataset_scaling_factor: int = 1,
         neighbor_selection_mode: NeighborSelectionMode = NeighborSelectionMode.EVENLY_SPACED,
         max_test_frames: int | None = None,
         include_all_frames: bool = False,
         filter_scene_id: str | None = None,
         checkpoint: str = "30000",
-        recon_experiment_name: str | None = None,
         image_folder: str | None = None,  # If None, uses per-scene mapping for height=960
-        generator: torch.Generator | None = None,
+        resize_multiple: int = 16,
+        *,
+        prompt_format: str,
+        camera_pose_alignment: str = "mean",
         verbose: bool = False,
     ):
+        assert recon_experiment_name, "NerfBusters eval requires the 3DGRUT reconstruction experiment name"
         self.nerfbusters_dir = Path(nerfbusters_dir)
         self.recon_results_dir = Path(recon_results_dir)
         self.recon_experiment_name = recon_experiment_name
@@ -86,12 +95,15 @@ class NerfbustersEvalDataset(torch.utils.data.Dataset):
         self.neighbor_selection_mode = neighbor_selection_mode
         self.checkpoint = checkpoint
         self.image_folder = image_folder  # None means use per-scene mapping
-        self.generator = generator
+        self.resize_multiple = resize_multiple
+        self.prompt_format = prompt_format
+        self.camera_pose_alignment = camera_pose_alignment
 
         self.transforms_by_scene_id = {}
+        self.video_frame_indices_by_scene_id = {}
         self.train_ids_by_scene_id = {}
         self.test_ids_by_scene_id = {}
-        self.captions_by_scene_id: dict[str, List[Path]] = {}
+        self.captions_by_scene_id: dict[str, Path] = {}
         self.inference_items: List[Tuple[str, InferencePair]] = []
 
         # Discover scenes
@@ -119,19 +131,18 @@ class NerfbustersEvalDataset(torch.utils.data.Dataset):
             # frame_XXXXX.png = TRAIN, frame_1_XXXXX.png = TEST
             train_ids, test_ids = self._get_train_test_split(transforms)
 
-            # Filter by num_frames if specified
-            if num_frames is not None and total_frames < num_frames:
-                if verbose:
-                    print(f"Skipping {scene_id}: only {total_frames} frames (need {num_frames})")
-                continue
-
             self.transforms_by_scene_id[scene_id] = transforms
+            ordered_indices = self._sort_indices_by_frame_number(transforms, list(range(total_frames)))
+            self.video_frame_indices_by_scene_id[scene_id] = {
+                source_index: video_index for video_index, source_index in enumerate(ordered_indices)
+            }
             self.train_ids_by_scene_id[scene_id] = train_ids
             self.test_ids_by_scene_id[scene_id] = test_ids
 
-            caption_path = self.captions_dir / f"{scene_id}.h5"
-            assert caption_path.exists(), f"Caption file not found for {scene_id} at {caption_path}"
-            self.captions_by_scene_id[scene_id] = [caption_path]
+            caption_path = self.captions_dir / caption_filename_for_format(f"{scene_id}.h5", self.prompt_format)
+            if not caption_path.exists():
+                raise FileNotFoundError(f"Scene {scene_id} has no evaluation caption {caption_path}")
+            self.captions_by_scene_id[scene_id] = caption_path
 
             # Get extrinsics for covisibility-based selection
             extrinsics_c2w = None
@@ -159,30 +170,7 @@ class NerfbustersEvalDataset(torch.utils.data.Dataset):
             print(f"Loaded {len(self.transforms_by_scene_id)} scenes, {len(self.inference_items)} inference items")
 
     def _get_train_test_split(self, transforms: dict) -> tuple[set, set]:
-        """
-        Get train/test split based on filename convention.
-
-        Nerfbusters naming:
-        - frame_XXXXX.png = TRAIN (no _1_ in middle)
-        - frame_1_XXXXX.png = TEST (has _1_ in middle)
-
-        Returns:
-            train_ids: Set of transforms indices for train frames
-            test_ids: Set of transforms indices for test frames
-        """
-        train_ids = set()
-        test_ids = set()
-
-        train_pattern = re.compile(r"^frame_\d+\.png$")
-
-        for idx, frame in enumerate(transforms["frames"]):
-            basename = os.path.basename(frame["file_path"])
-            if train_pattern.match(basename):
-                train_ids.add(idx)
-            else:
-                test_ids.add(idx)
-
-        return train_ids, test_ids
+        return nerfbusters_train_test_split(transforms)
 
     def _extract_frame_number(self, file_path: str) -> int:
         """Extract numeric frame number from filename.
@@ -201,7 +189,7 @@ class NerfbustersEvalDataset(torch.utils.data.Dataset):
         This ensures temporal ordering since transforms.json is NOT in order.
         """
         indexed = [(idx, self._extract_frame_number(transforms["frames"][idx]["file_path"])) for idx in indices]
-        indexed.sort(key=lambda x: x[1])
+        indexed.sort(key=lambda x: (x[1], x[0]))
         return [idx for idx, _ in indexed]
 
     def _split_pair_by_frame_number_gaps(self, transforms: dict, pair: InferencePair) -> List[InferencePair]:
@@ -246,24 +234,11 @@ class NerfbustersEvalDataset(torch.utils.data.Dataset):
         return split_pairs
 
     def _get_checkpoint_dir(self, scene_id: str) -> Path:
-        """Get the checkpoint directory for a scene.
-
-        3DGRUT outputs to: {recon_results_dir}/{scene_id}/{experiment_name}/{scene_id}/ours_{step}/
-        """
-        if self.recon_experiment_name:
-            return self.recon_results_dir / scene_id / self.recon_experiment_name / scene_id / f"ours_{self.checkpoint}"
-        else:
-            # Legacy path structure
-            return self.recon_results_dir / scene_id / f"checkpoint_{self.checkpoint}"
+        """3DGRUT outputs to {recon_results_dir}/{scene_id}/{experiment_name}/{scene_id}/ours_{step}/."""
+        return self.recon_results_dir / scene_id / self.recon_experiment_name / scene_id / f"ours_{self.checkpoint}"
 
     def _get_render_dir(self, scene_id: str) -> Path:
-        """Get the render output directory for a scene."""
-        if self.recon_experiment_name:
-            # 3DGRUT uses "renders" folder
-            return self._get_checkpoint_dir(scene_id) / "renders"
-        else:
-            # Legacy path structure uses "render"
-            return self._get_checkpoint_dir(scene_id) / "render"
+        return self._get_checkpoint_dir(scene_id) / "renders"
 
     def _get_image_folder_for_scene(self, scene_id: str) -> str:
         """Get the appropriate image folder for a scene to get closest to target resolution."""
@@ -317,32 +292,31 @@ class NerfbustersEvalDataset(torch.utils.data.Dataset):
 
         item = {}
 
-        # Load encoded prompt from captions if available, otherwise use dummy
-        encoded_prompt, caption = load_encoded_prompt(
+        prompt_payload, caption = load_prompt_payload_from_path(
             self.captions_by_scene_id[scene_id],
-            self.generator,
+            prompt_format=self.prompt_format,
         )
-        item["encoded_prompt"] = encoded_prompt
+        item.update(prompt_payload)
         item["prompt"] = caption
 
         # Load rendered images from reconstruction results
         render_dir = self._get_render_dir(scene_id)
         rgb_rendered = load_indexed_frames(render_dir, frame_indices, filename_format="{:05d}.png")
-        item["rgb_rendered"] = resize_to_multiple_of_16(rgb_rendered)
+        item["rgb_rendered"] = resize_to_multiple(rgb_rendered, self.resize_multiple)
 
         # Load ground truth
         rgb_gt = self._load_frames_from_scene(scene_id, frame_indices)
         item["target_h"] = rgb_gt.shape[-2]
         item["target_w"] = rgb_gt.shape[-1]
-        item["rgb_gt"] = resize_to_multiple_of_16(rgb_gt)
+        item["rgb_gt"] = resize_to_multiple(rgb_gt, self.resize_multiple)
 
         # Load neighbor frames
         rgb_neighbors = self._load_frames_from_scene(scene_id, neighbor_indices)
-        item["rgb_neighbors"] = resize_to_multiple_of_16(rgb_neighbors)
+        item["rgb_neighbors"] = resize_to_multiple(rgb_neighbors, self.resize_multiple)
 
         opacity_dir = self._get_checkpoint_dir(scene_id) / "opacity"
         opacity = load_indexed_frames(opacity_dir, frame_indices, filename_format="{:05d}.png", grayscale=True)
-        item["opacity"] = resize_to_multiple_of_16(opacity).squeeze(1)
+        item["opacity"] = resize_to_multiple(opacity, self.resize_multiple).squeeze(1)
 
         # Compute camera rays
         camera_items = compute_camera_rays(
@@ -350,8 +324,10 @@ class NerfbustersEvalDataset(torch.utils.data.Dataset):
             frame_indices=list(frame_indices),
             neighbor_indices=list(neighbor_indices),
             scale=self.dataset_scaling_factor,
-            image_shape=(item["rgb_neighbors"].shape[-2], item["rgb_neighbors"].shape[-1]),
+            image_shape=item["rgb_rendered"].shape[-2:],
             skip_vae_check=True,  # Eval script handles padding
+            pose_alignment=self.camera_pose_alignment,
+            include_neighbor_rays=requires_reference_camera_rays(self.prompt_format),
         )
         item.update(camera_items)
 
@@ -359,6 +335,12 @@ class NerfbustersEvalDataset(torch.utils.data.Dataset):
         item["scene_id"] = scene_id
         item["chunk_idx"] = pair.chunk_idx
         item["frame_indices"] = torch.tensor(frame_indices, dtype=torch.long)
+        # Train and test filenames can share a frame number. Use their unique
+        # position in the full scene's temporal order, including across chunks.
+        item["video_frame_indices"] = torch.tensor(
+            [self.video_frame_indices_by_scene_id[scene_id][index] for index in frame_indices],
+            dtype=torch.long,
+        )
         item["neighbor_indices"] = torch.tensor(neighbor_indices, dtype=torch.long)
 
         # Determine which frames are test frames

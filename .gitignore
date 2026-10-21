@@ -17,6 +17,8 @@ downloads/
 eggs/
 .eggs/
 lib/
+# ... but the Slurm launcher libraries are source, not packaging output.
+!model_training/slurm/lib/
 lib64/
 parts/
 sdist/

@@ -1,5 +1,5 @@
 {
-  "description": "DL3DV DiFix eval uses the compact frame space from DL3DV-Benchmark/<scene>/nerfstudio. These frames are absent from that compact frame list but present in DL3DV-ALL-960P, so release eval drops them before applying DiFix train ids and visibility masks.",
+  "description": "DL3DV DiFix eval uses a compact DiFix frame space. These frames are absent from that compact frame list but present in DL3DV-ALL-960P, so release eval drops them before applying DiFix train ids and visibility masks.",
   "scenes": {
     "15ff83e2531668d27c92091c97d31401ce323e24ee7c844cb32d5109ab9335f7": {
       "dropped_file_basenames": [

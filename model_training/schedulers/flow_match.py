@@ -111,7 +111,7 @@ class FlowMatchScheduler:
         sample = (1 - sigma) * original_samples + sigma * noise
         return sample
 
-    # Used when per-frame noise is different (as in diffuson forcing)
+    # Used when diffusion-forcing training samples different timesteps per latent frame block.
     def add_noise_multi_timestep(self, original_samples, noise, timestep):
         if isinstance(timestep, torch.Tensor):
             timestep = timestep.to(self.timesteps.device)

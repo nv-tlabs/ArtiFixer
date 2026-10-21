@@ -12,38 +12,30 @@ from functools import lru_cache
 from pathlib import Path
 
 import h5py
-import numpy as np
 import torch
-from PIL import Image
-from torchmetrics import PeakSignalNoiseRatio
-from torchmetrics.functional import structural_similarity_index_measure as ssim_masked
-from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 
-from model_eval.lpipsPytorch import lpips
-
+from data_processing.scene_utils import read_scene_list
 from model_eval.dl3dv_difix_frame_remap import apply_difix_frame_remap
+from model_eval.dl3dv_reconstruction_evalsets import RECON_SUBDIR_BY_EVALSET, default_dl3dv_num_views
 from model_eval.metrics_utils import (
-    FIDTracker,
-    MetricsAggregator,
-    compute_rgb_metrics,
+    MetricSuite,
+    build_sorted_test_mask_index,
     downsampled_image_path,
     load_dl3dv_scene_transforms,
     load_dl3dv_scene_zip_bytes,
     load_image_as_tensor,
     load_subdir_by_scene_id,
+    load_visibility_mask,
+    validate_frame_coverage,
 )
+from model_eval.reconstructed_colmap_evalsets import num_views_output_label
+from model_training.utils.video_io import probe_video_frame_count
 
 DL3DV_EVALSETS = ("3dgrut_dl3dv_ours", "3dgrut_dl3dv_difix", "artifixer3d_dl3dv_ours", "artifixer3d_dl3dv_difix")
 DIFIX_EVALSETS = {"3dgrut_dl3dv_difix", "artifixer3d_dl3dv_difix"}
 OURS_EVALSETS = {"3dgrut_dl3dv_ours", "artifixer3d_dl3dv_ours"}
 
-
-def _load_mask(mask_path: Path, target_size: tuple[int, int], device: torch.device, threshold: int = 1) -> torch.Tensor:
-    """Load a visibility mask, resize to (W, H), and threshold count values."""
-    resample_nearest = getattr(Image, "Resampling", Image).NEAREST
-    mask_image = Image.open(mask_path).convert("L").resize(target_size, resample_nearest)
-    mask = torch.from_numpy(np.array(mask_image)).to(device)
-    return (mask >= threshold).float().unsqueeze(0).unsqueeze(0)
+DATA_PROCESSING_DIR = Path(__file__).resolve().parents[1] / "data_processing"
 
 
 @lru_cache(maxsize=None)
@@ -71,16 +63,6 @@ def _hdf5_reconstruction_path(scene_id: str, num_views: int, split_path: Path) -
     return Path(matches[0]["hdf5_path"])
 
 
-def read_scene_id_list(path: Path) -> list[str]:
-    scene_ids = []
-    with path.open() as f:
-        for line in f:
-            scene_id = line.strip()
-            if scene_id and not scene_id.startswith("#"):
-                scene_ids.append(scene_id)
-    return scene_ids
-
-
 def load_metric_scene_ids(split_path: Path) -> list[str]:
     split = _load_split(split_path)
     return sorted(split["test"])
@@ -92,64 +74,125 @@ def load_hdf5_training_indices(scene_id: str, num_views: int, split_path: Path) 
         return set(f["selected_indices"][:].tolist())
 
 
+def load_hdf5_frame_count(scene_id: str, num_views: int, split_path: Path) -> int:
+    hdf5_file = _hdf5_reconstruction_path(scene_id, num_views, split_path)
+    with h5py.File(hdf5_file, "r") as handle:
+        count = handle.attrs.get("n_frames")
+        if count is None and "depth_np_array" in handle:
+            count = handle["depth_np_array"].shape[0]
+        if count is None and "render_video" in handle:
+            count = probe_video_frame_count(handle["render_video"][:].tobytes())
+        if count is None:
+            raise ValueError(
+                f"Cannot determine source frame count from {hdf5_file}: missing n_frames, depth data, and render_video"
+            )
+    frame_count = int(count)
+    if frame_count <= 0 or frame_count != count:
+        raise ValueError(f"Invalid source frame count in {hdf5_file}: {count!r}")
+    return frame_count
+
+
 def load_difix_training_indices(train_ids_dir: Path, scene_id: str) -> set[int]:
     """Load held-in DiFix training frame ids so metrics skip source-view frames."""
     with (train_ids_dir / scene_id / "difix_train_ids.json").open() as f:
         return set(json.load(f))
 
 
+def parse_num_views(value: str | int | None) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, int):
+        if value <= 0:
+            raise ValueError("--num_views must be positive")
+        return value
+    if value == "auto":
+        return None
+    parsed = int(value)
+    if parsed <= 0:
+        raise ValueError("--num_views must be positive")
+    return parsed
+
+
+def _reconstruction_checkpoint_dir(
+    recon_results_dir: Path, scene_id: str, checkpoint: str, recon_subdir: str | None
+) -> Path:
+    if recon_subdir is None:
+        return (
+            recon_results_dir
+            / "difix_split_reconstruction_eval"
+            / scene_id
+            / "difix_split_reconstruction"
+            / scene_id
+            / f"ours_{checkpoint}"
+        )
+    return recon_results_dir / scene_id / recon_subdir / scene_id / f"ours_{checkpoint}"
+
+
+def load_reconstruction_training_indices(
+    recon_results_dir: Path,
+    scene_id: str,
+    *,
+    checkpoint: str,
+    recon_subdir: str | None,
+) -> set[int]:
+    checkpoint_dir = _reconstruction_checkpoint_dir(recon_results_dir, scene_id, checkpoint, recon_subdir)
+    with (checkpoint_dir / "selected_indices.json").open() as f:
+        return set(json.load(f))
+
+
+def load_reconstruction_frame_count(
+    recon_results_dir: Path, scene_id: str, *, checkpoint: str, recon_subdir: str | None
+) -> int:
+    checkpoint_dir = _reconstruction_checkpoint_dir(recon_results_dir, scene_id, checkpoint, recon_subdir)
+    render_indices = sorted(int(path.stem) for path in (checkpoint_dir / "renders").glob("*.png"))
+    opacity_indices = sorted(int(path.stem) for path in (checkpoint_dir / "opacity").glob("*.png"))
+    if render_indices != opacity_indices:
+        raise ValueError(f"Mismatched reconstruction render/opacity frame IDs in {checkpoint_dir}")
+    validate_frame_coverage(render_indices, set(range(len(render_indices))), label=str(checkpoint_dir))
+    return len(render_indices)
+
+
 def build_difix_mask_index(transforms: dict, training_indices: set[int]) -> dict[int, int]:
-    """Map transform frame ids to compact DiFix visibility-mask ids.
-
-    DiFix visibility masks are numbered over sorted held-out/test frame names,
-    while rendered predictions are named by transforms.json frame index.
-    """
-    test_frames = []
-    for frame_idx, frame in enumerate(transforms["frames"]):
-        if frame_idx in training_indices:
-            continue
-        test_frames.append((frame_idx, os.path.basename(frame["file_path"])))
-    test_frames.sort(key=lambda item: item[1])
-    return {frame_idx: mask_idx for mask_idx, (frame_idx, _) in enumerate(test_frames)}
+    """Map transform frame ids to compact DiFix visibility-mask ids."""
+    test_indices = set(range(len(transforms["frames"]))) - training_indices
+    return build_sorted_test_mask_index(transforms, test_indices)
 
 
-def resolve_difix_mask_path(visibility_masks_dir: Path, scene_id: str, frame_idx: int, mask_idx: int | None) -> Path | None:
-    scene_mask_dir = visibility_masks_dir / scene_id / "visibility_median_count"
-    candidate_paths = []
-    if mask_idx is not None:
-        candidate_paths.append(scene_mask_dir / f"{mask_idx:05d}.png")
-    candidate_paths.append(scene_mask_dir / f"{frame_idx:05d}.png")
-    for candidate_path in candidate_paths:
-        if candidate_path.exists():
-            return candidate_path
-    return None
+def resolve_difix_mask_path(
+    visibility_masks_dir: Path, scene_id: str, frame_idx: int, mask_idx: int | None
+) -> Path | None:
+    mask_index = frame_idx if mask_idx is None else mask_idx
+    path = visibility_masks_dir / scene_id / "visibility_median_count" / f"{mask_index:05d}.png"
+    return path if path.is_file() else None
 
 
 def compute_metrics(
-    eval_output_name: str,
-    num_views: int,
+    render_name: str,
+    num_views: int | None,
     evalset: str,
     *,
     split_path: Path,
     dl3dv_dir: Path,
     eval_base_path: Path,
     use_masks: bool = True,
-    sink_size: int = 7,
     render_trajectory: str = "val_frames",
     visibility_masks_dir: Path | None = None,
     test_scene_ids: Sequence[str] | None = None,
     training_indices_for_scene: Callable[[str], set[int]] | None = None,
+    frame_count_for_scene: Callable[[str], int] | None = None,
     metrics_suffix: str = "",
     masked_lpips_backend: str = "torchmetrics",
+    lpips_protocol: str = "standard",
+    neighbor_selection_mode: str = "evenly_spaced",
+    output_suffix: str = "",
 ) -> None:
     """Compute per-scene and aggregated metrics for rendered eval outputs.
 
     Args:
-        eval_output_name: rendered eval output subdirectory under EVAL_BASE_PATH.
+        render_name: the render run's directory name under eval_base_path.
         num_views: number of training views used for evaluation.
         evalset: label used to construct the render output directory (e.g. "3dgrut_dl3dv_ours").
         use_masks: also compute visibility-masked variants of each metric.
-        sink_size: optional attention-sink suffix encoded in the render dir name.
         split_path: split JSON used by eval and by ours HDF5 selected_indices lookup.
         dl3dv_dir: DL3DV zip root.
         eval_base_path: root containing rendered eval outputs.
@@ -158,51 +201,53 @@ def compute_metrics(
         test_scene_ids: explicit scene ids to evaluate for custom comparison paths.
         metrics_suffix: optional suffix for sidecar metric YAMLs.
         masked_lpips_backend: LPIPS implementation for masked metrics.
+        lpips_protocol: standard normalization, or legacy to reproduce historical scores.
+        neighbor_selection_mode: neighbor selection mode used by the render run.
+        output_suffix: output-directory suffix used by the render run.
         training_indices_for_scene: optional callback for custom comparison eval paths.
             Defaults to reading selected_indices from the ArtiFixer HDF5 referenced by split_path.
+        frame_count_for_scene: available reconstruction frames. Defaults to HDF5 metadata when
+            it supplies training indices, otherwise the source transforms' frame count.
     """
     if use_masks and visibility_masks_dir is None:
         raise ValueError("--visibility_masks_dir is required unless --no_masks is set")
     if test_scene_ids is None:
         test_scene_ids = load_metric_scene_ids(split_path)
+    test_scene_ids = tuple(test_scene_ids)
     if training_indices_for_scene is None:
         training_indices_for_scene = lambda scene_id: load_hdf5_training_indices(scene_id, num_views, split_path)
+        if frame_count_for_scene is None:
+            frame_count_for_scene = lambda scene_id: load_hdf5_frame_count(scene_id, num_views, split_path)
+
+    # Mirrors the per-evalset subtree run_inference writes under the render name.
+    trajectory_part = "" if render_trajectory == "val_frames" else f"_{render_trajectory}"
+    output_suffix_part = f"_{output_suffix}" if output_suffix else ""
+    eval_mode = (
+        f"distilled_views_{evalset}_{num_views_output_label(num_views)}_{neighbor_selection_mode}"
+        f"{trajectory_part}{output_suffix_part}"
+    )
+    path = eval_base_path / render_name / eval_mode
+
+    if not path.exists():
+        raise FileNotFoundError(f"Eval path not found: {path}")
+
+    missing_scene_ids = [scene_id for scene_id in test_scene_ids if not (path / scene_id).is_dir()]
+    if missing_scene_ids:
+        formatted_scene_ids = ", ".join(missing_scene_ids)
+        raise FileNotFoundError(
+            f"Missing {len(missing_scene_ids)} expected DL3DV scene output directories under {path}: "
+            f"{formatted_scene_ids}"
+        )
+
     scene_id_to_subdir = load_subdir_by_scene_id(split_path)
 
-    sink_suffix = f"_sink{sink_size}" if sink_size > 0 else ""
-    trajectory_suffix = "" if render_trajectory == "val_frames" else f"_{render_trajectory}"
-    eval_mode = f"distilled_views_{evalset}_{num_views}_evenly_spaced{sink_suffix}{trajectory_suffix}"
-    path = eval_base_path / eval_output_name / eval_mode
-
     device = torch.device("cuda")
-
-    psnr_masked = PeakSignalNoiseRatio(data_range=1.0).to(device)
-    lpips_masked = None
-    if masked_lpips_backend == "torchmetrics":
-        lpips_masked = LearnedPerceptualImagePatchSimilarity(normalize=True).to(device)
-
-    metric_names = ["psnr", "ssim", "lpips"]
-    ours_metrics = MetricsAggregator(metric_names)
-    gut_metrics = MetricsAggregator(metric_names)
-    ours_metrics_masked = MetricsAggregator(metric_names)
-    gut_metrics_masked = MetricsAggregator(metric_names)
-    ours_fid = FIDTracker(device)
-    gut_fid = FIDTracker(device)
-    ours_fid_masked = FIDTracker(device)
-    gut_fid_masked = FIDTracker(device)
-
-    def masked_lpips_value(image: torch.Tensor, target: torch.Tensor) -> float:
-        image = image.clamp(0, 1)
-        target = target.clamp(0, 1)
-        if lpips_masked is not None:
-            return lpips_masked(image, target).detach().cpu().item()
-        return lpips(image, target, net_type=masked_lpips_backend).item()
+    suite = MetricSuite(
+        device, use_masks=use_masks, masked_lpips_backend=masked_lpips_backend, lpips_protocol=lpips_protocol
+    )
 
     with torch.inference_mode():
         for scene_id in test_scene_ids:
-            if not (path / scene_id).exists():
-                print(f"Scene {scene_id} not found")
-                continue
             print(f"Processing scene {scene_id}...")
 
             subdir = scene_id_to_subdir[scene_id]
@@ -211,31 +256,35 @@ def compute_metrics(
             transforms = load_dl3dv_scene_transforms(dl3dv_dir, subdir, scene_id)
             if evalset in DIFIX_EVALSETS:
                 transforms = apply_difix_frame_remap(transforms, scene_id)
+            total_frames = len(transforms["frames"])
+            if frame_count_for_scene is not None:
+                render_frames = frame_count_for_scene(scene_id)
+                if evalset in DIFIX_EVALSETS and render_frames != total_frames:
+                    raise ValueError(f"Scene {scene_id} has {render_frames} renders but {total_frames} remapped frames")
+                total_frames = min(total_frames, render_frames)
+            training_indices = {index for index in training_indices if 0 <= index < total_frames}
+            expected_indices = set(range(total_frames)) - training_indices
             frame_idx_to_path = {
-                i: downsampled_image_path(frame["file_path"], 4) for i, frame in enumerate(transforms["frames"])
+                i: downsampled_image_path(frame["file_path"], 4)
+                for i, frame in enumerate(transforms["frames"][:total_frames])
             }
             difix_mask_index = build_difix_mask_index(transforms, training_indices) if evalset in DIFIX_EVALSETS else {}
 
             pred_dir = path / scene_id / "frames" / "batch_0000" / "pred"
             rendered_dir = path / scene_id / "frames" / "batch_0000" / "rendered"
-
             pred_files = sorted(glob.glob(os.path.join(pred_dir, "*.png")))
             rendered_files = sorted(glob.glob(os.path.join(rendered_dir, "*.png")))
-            if len(pred_files) != len(rendered_files):
-                raise ValueError(
-                    f"Mismatched file counts: {len(pred_files)} pred vs {len(rendered_files)} rendered for {scene_id}"
-                )
             pred_names = [os.path.basename(path) for path in pred_files]
             rendered_names = [os.path.basename(path) for path in rendered_files]
             if pred_names != rendered_names:
                 raise ValueError(f"Mismatched frame names between pred and rendered outputs for {scene_id}")
-
-            if not pred_files:
-                raise ValueError(f"No PNG frames found in {pred_dir} and {rendered_dir} for scene {scene_id}")
             frame_indices = [int(os.path.splitext(name)[0]) for name in pred_names]
-            needed_relpaths = [
-                frame_idx_to_path[frame_idx] for frame_idx in frame_indices if frame_idx not in training_indices
-            ]
+            validate_frame_coverage(
+                [index for index in frame_indices if index not in training_indices],
+                expected_indices,
+                label=str(path / scene_id),
+            )
+            needed_relpaths = [frame_idx_to_path[index] for index in frame_indices if index in expected_indices]
             gt_bytes_by_path = load_dl3dv_scene_zip_bytes(dl3dv_dir, subdir, scene_id, needed_relpaths)
 
             for pred_file, rendered_file, frame_idx in zip(pred_files, rendered_files, frame_indices):
@@ -246,10 +295,7 @@ def compute_metrics(
                 pred = load_image_as_tensor(pred_file, device)
                 rendered = load_image_as_tensor(rendered_file, device)
 
-                ours_metrics.add(scene_id, **compute_rgb_metrics(pred, gt))
-                gut_metrics.add(scene_id, **compute_rgb_metrics(rendered, gt))
-                ours_fid.update(pred, gt)
-                gut_fid.update(rendered, gt)
+                suite.update(scene_id, pred, rendered, gt)
 
                 if use_masks:
                     mask_path = resolve_difix_mask_path(
@@ -258,69 +304,53 @@ def compute_metrics(
                         frame_idx,
                         difix_mask_index.get(frame_idx),
                     )
-                    if mask_path is not None:
-                        mask = _load_mask(mask_path, (gt.shape[3], gt.shape[2]), device, threshold=1)
-                        pred_m, rendered_m, gt_m = pred * mask, rendered * mask, gt * mask
-
-                        ours_metrics_masked.add(
-                            scene_id,
-                            psnr=psnr_masked(pred_m, gt_m).cpu().item(),
-                            ssim=ssim_masked(pred_m, gt_m, data_range=1.0).cpu().item(),
-                            lpips=masked_lpips_value(pred_m, gt_m),
+                    if mask_path is None:
+                        raise FileNotFoundError(
+                            f"Missing visibility mask for scene {scene_id}, frame {frame_idx} in {visibility_masks_dir}"
                         )
-                        gut_metrics_masked.add(
-                            scene_id,
-                            psnr=psnr_masked(rendered_m, gt_m).cpu().item(),
-                            ssim=ssim_masked(rendered_m, gt_m, data_range=1.0).cpu().item(),
-                            lpips=masked_lpips_value(rendered_m, gt_m),
-                        )
-                        ours_fid_masked.update(pred_m, gt_m)
-                        gut_fid_masked.update(rendered_m, gt_m)
+                    mask = load_visibility_mask(mask_path, (gt.shape[3], gt.shape[2]), device, threshold=1)
+                    suite.update_masked(scene_id, pred, rendered, gt, mask)
 
-            gut_metrics.print_scene_summary(scene_id, prefix="3D-GUT ")
-            ours_metrics.print_scene_summary(scene_id)
-            if use_masks and ours_metrics_masked.scene_metrics.get(scene_id):
-                gut_metrics_masked.print_scene_summary(scene_id, prefix="3D-GUT (masked) ")
-                ours_metrics_masked.print_scene_summary(scene_id, prefix="(masked) ")
+            suite.gut.print_scene_summary(scene_id, prefix="3D-GUT ")
+            suite.ours.print_scene_summary(scene_id)
+            if use_masks:
+                suite.gut_masked.print_scene_summary(scene_id, prefix="3D-GUT (masked) ")
+                suite.ours_masked.print_scene_summary(scene_id, prefix="(masked) ")
 
-        ours_fid_score = ours_fid.compute()
-        gut_fid_score = gut_fid.compute()
-        ours_fid_masked_score = ours_fid_masked.compute() if use_masks else None
-        gut_fid_masked_score = gut_fid_masked.compute() if use_masks else None
+        suite.ours.require_values("psnr", path, evalset=evalset)
+        suite.gut.require_values("psnr", path, evalset=evalset)
 
-        print("\n=== Summary ===")
-        gut_metrics.print_overall_summary(prefix="3D-GUT ")
-        if gut_fid_score is not None:
-            print(f"3D-GUT fid: {gut_fid_score:.4f}")
-        ours_metrics.print_overall_summary()
-        if ours_fid_score is not None:
-            print(f"fid: {ours_fid_score:.4f}")
-
-        if use_masks and ours_metrics_masked.get_all_values("psnr"):
-            print()
-            gut_metrics_masked.print_overall_summary(prefix="3D-GUT (masked) ")
-            if gut_fid_masked_score is not None:
-                print(f"3D-GUT (masked) fid: {gut_fid_masked_score:.4f}")
-            ours_metrics_masked.print_overall_summary(prefix="(masked) ")
-            if ours_fid_masked_score is not None:
-                print(f"(masked) fid: {ours_fid_masked_score:.4f}")
-
-        suffix = f"_{metrics_suffix}" if metrics_suffix else ""
-        ours_metrics.save_to_yaml(path / f"metrics{suffix}.yaml", include_per_frame=True, fid=ours_fid_score)
-        gut_metrics.save_to_yaml(path / f"metrics_3dgut{suffix}.yaml", include_per_frame=True, fid=gut_fid_score)
-
-        if use_masks and ours_metrics_masked.get_all_values("psnr"):
-            ours_metrics_masked.save_to_yaml(path / f"metrics_masked{suffix}.yaml", fid=ours_fid_masked_score)
-            gut_metrics_masked.save_to_yaml(path / f"metrics_3dgut_masked{suffix}.yaml", fid=gut_fid_masked_score)
+        suite.report(path, metrics_suffix=metrics_suffix)
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--eval_output_name", type=str, required=True)
-    parser.add_argument("--num_views", type=int, default=6)
+    parser.add_argument(
+        "--render_name",
+        type=str,
+        required=True,
+        help="The render run's --render_name; renders are read from EVAL_BASE_PATH/<render_name>.",
+    )
+    parser.add_argument(
+        "--num_views",
+        default=None,
+        help="Reference-view count used by inference, or auto for per-scene selection. "
+        "Defaults to 6 for 3dgrut_dl3dv_ours and auto for reconstruction-directory evalsets.",
+    )
     parser.add_argument("--evalset", choices=DL3DV_EVALSETS, required=True)
-    parser.add_argument("--sink_size", type=int, default=7, help="Sink size suffix (e.g. 7 for _sink7)")
     parser.add_argument("--render_trajectory", choices=["val_frames", "all_frames"], default="val_frames")
+    parser.add_argument(
+        "--neighbor_selection_mode",
+        choices=["consecutive", "evenly_spaced", "covisibility"],
+        default="evenly_spaced",
+        help="Neighbor selection mode used by the render run (part of its output directory name).",
+    )
+    parser.add_argument(
+        "--output_suffix",
+        type=str,
+        default="",
+        help="Output-directory suffix used by the render run.",
+    )
     parser.add_argument("--no_masks", action="store_true")
     parser.add_argument("--split_path", type=Path, required=True)
     parser.add_argument("--dl3dv_dir", type=Path, required=True)
@@ -333,34 +363,82 @@ def parse_args() -> argparse.Namespace:
         default="torchmetrics",
     )
     parser.add_argument(
+        "--lpips_protocol",
+        choices=("standard", "legacy"),
+        default="standard",
+        help="Use standard LPIPS normalization; legacy only reproduces historical scores.",
+    )
+    parser.add_argument(
         "--difix_train_ids_dir",
         type=Path,
         help="Directory containing per-scene difix_train_ids.json; required for DiFix evalsets.",
     )
-    return parser.parse_args()
+    parser.add_argument(
+        "--recon_results_dir",
+        type=Path,
+        help="Reconstruction output root; required for directory-based reconstruction evalsets.",
+    )
+    parser.add_argument(
+        "--dl3dv_recon_subdir",
+        type=str,
+        default=None,
+        help="Reconstruction experiment subdir under each DL3DV scene.",
+    )
+    parser.add_argument(
+        "--dl3dv_reconstruction_checkpoint",
+        type=str,
+        default="30000",
+        help="Reconstruction checkpoint iteration used for selected_indices.json lookup.",
+    )
+    args = parser.parse_args(argv)
+    try:
+        args.num_views = (
+            default_dl3dv_num_views(args.evalset) if args.num_views is None else parse_num_views(args.num_views)
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
+    if args.num_views is None and args.evalset == "3dgrut_dl3dv_ours":
+        parser.error("--num_views auto is not supported for 3dgrut_dl3dv_ours; pass a numeric view count")
+    if args.evalset in RECON_SUBDIR_BY_EVALSET and args.recon_results_dir is None:
+        parser.error("--recon_results_dir is required for directory-based reconstruction evalsets")
+    return args
 
 
 def main() -> None:
     args = parse_args()
 
+    num_views = args.num_views
     test_scene_ids = None
     training_indices_for_scene = None
+    frame_count_for_scene = None
+    recon_subdir = args.dl3dv_recon_subdir or RECON_SUBDIR_BY_EVALSET.get(args.evalset)
+    if args.recon_results_dir is not None and args.evalset in RECON_SUBDIR_BY_EVALSET:
+        frame_count_for_scene = lambda scene_id: load_reconstruction_frame_count(
+            args.recon_results_dir,
+            scene_id,
+            checkpoint=args.dl3dv_reconstruction_checkpoint,
+            recon_subdir=recon_subdir,
+        )
     if args.evalset in DIFIX_EVALSETS:
         if args.difix_train_ids_dir is None:
             raise ValueError("--difix_train_ids_dir is required for DiFix DL3DV evalsets")
-        difix_scene_list_path = Path("data_processing/dl3dv_benchmark_difix_test_scenes.txt")
-        test_scene_ids = read_scene_id_list(difix_scene_list_path)
+        test_scene_ids = read_scene_list(DATA_PROCESSING_DIR / "dl3dv_benchmark_difix_test_scenes.txt")
         training_indices_for_scene = lambda scene_id: load_difix_training_indices(args.difix_train_ids_dir, scene_id)
     elif args.evalset in OURS_EVALSETS:
-        ours_scene_list_path = Path("data_processing/dl3dv_benchmark_ours_test_scenes.txt")
-        test_scene_ids = read_scene_id_list(ours_scene_list_path)
+        test_scene_ids = read_scene_list(DATA_PROCESSING_DIR / "dl3dv_benchmark_ours_test_scenes.txt")
+        if args.evalset in RECON_SUBDIR_BY_EVALSET:
+            training_indices_for_scene = lambda scene_id: load_reconstruction_training_indices(
+                args.recon_results_dir,
+                scene_id,
+                checkpoint=args.dl3dv_reconstruction_checkpoint,
+                recon_subdir=recon_subdir,
+            )
 
     compute_metrics(
-        eval_output_name=args.eval_output_name,
-        num_views=args.num_views,
+        render_name=args.render_name,
+        num_views=num_views,
         evalset=args.evalset,
         use_masks=not args.no_masks,
-        sink_size=args.sink_size,
         render_trajectory=args.render_trajectory,
         split_path=args.split_path,
         dl3dv_dir=args.dl3dv_dir,
@@ -368,8 +446,12 @@ def main() -> None:
         visibility_masks_dir=args.visibility_masks_dir,
         test_scene_ids=test_scene_ids,
         training_indices_for_scene=training_indices_for_scene,
+        frame_count_for_scene=frame_count_for_scene,
         metrics_suffix=args.metrics_suffix,
         masked_lpips_backend=args.masked_lpips_backend,
+        lpips_protocol=args.lpips_protocol,
+        neighbor_selection_mode=args.neighbor_selection_mode,
+        output_suffix=args.output_suffix,
     )
 
 

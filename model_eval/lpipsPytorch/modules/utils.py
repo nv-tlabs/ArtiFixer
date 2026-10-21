@@ -26,7 +26,7 @@ def get_state_dict(net_type: str = "alex", version: str = "0.1"):
     old_state_dict = torch.hub.load_state_dict_from_url(
         url,
         progress=True,
-        map_location=None,
+        map_location="cpu",
     )
 
     # rename keys

@@ -5,6 +5,24 @@
 
 This file lists third-party code and licenses distributed with this project.
 
+Open-source components distributed inside the pre-built container images
+(everything installed on top of the NGC base image, including transitive
+dependencies) are listed in
+[the versioned, per-variant container notices](docker/notices/README.md).
+The [September CUDA12 table](THIRD-PARTY-NOTICES-CONTAINER.md) is historical.
+
+## LongLive VAE window mapping
+
+- File: `model_training/common/context_parallel.py`
+- Source: [NVlabs/LongLive](https://github.com/NVlabs/LongLive),
+  `wan_5b/distributed/sp_training.py`
+- License: Apache-2.0 (see [LICENSE](LICENSE))
+- Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES
+
+The latent-to-raw-frame mapping follows LongLive's left-halo VAE chunking,
+expressed here as a shared helper with explicit bounds and crop offsets.
+
+
 ## PRoPE Relative Positional Encoding
 
 - File: `model_training/net/prope.py`

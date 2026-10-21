@@ -1,0 +1,52 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Application dependencies shared by all ArtiFixer Dockerfiles. Core versions
+# are pinned; NGC packages and remaining transitive dependencies are inventoried
+# in release receipts. A clean source revision alone does not lock every input.
+#
+# Released images must not distribute ffmpeg codecs (see
+# tests/assert_no_ffmpeg_in_image.py). Do not add packages whose wheels bundle
+# ffmpeg: no `av` (PyAV) and no opencv-python/opencv-python-headless wheels
+# (the Dockerfiles build opencv from source with WITH_FFMPEG=OFF). The
+# imageio-ffmpeg pin below is satisfied in image builds by the Dockerfiles'
+# earlier --no-binary sdist install of the same version; never install its
+# platform wheel, which bundles an ffmpeg binary.
+accelerate==1.13.0
+# v0.39.0 carries the rope autocast fix. The release tag's commit is
+# a3608b512ed7248499a44c61d954965ed9bdae4d (verified identical to this PyPI
+# release); model_training/pins.py records both, and the launch asserts the
+# baked in-container install against that registry.
+diffusers==0.39.0
+# diffusers 0.39.0 requires >=0.8.0; the deployed images carry exactly 0.8.0.
+safetensors==0.8.0
+transformers==5.5.0
+# transformers 5.5.0 pulls this in transitively; pinned because the README's `hf download` commands need the 1.x CLI.
+huggingface_hub==1.29.0
+ftfy==6.3.1
+wandb==0.26.1
+torchmetrics==1.9.0
+imageio==2.37.0
+imageio-ffmpeg==0.6.0
+h5py==3.16.0
+torch-fidelity==0.4.0
+# MoGe 07444410f1e33f402353b99d6ccd26bd31e469e8 is built by install_moge.sh
+# with its OpenCV requirement changed to the codec-free headless distribution.
+# OpenCV 4.12 requires NumPy >=2,<2.3; keep all architectures on that ABI.
+numpy==2.2.6
+typing_extensions==4.15.0
+packaging==25.0
+click==8.5.0
+# Later QuACK releases require a newer, incompatible CUTLASS API.
+quack-kernels==0.4.1
+# Shipped by the NGC base images — deliberately unpinned so they track each
+# base (pinning them here would fight the base image's own versions).
+einops
+scipy
+tqdm
+Pillow
+matplotlib
+pyyaml
+# The formatting gate (tests/test_formatting.py) is judged against exactly these.
+black==24.8.0
+isort==5.13.2

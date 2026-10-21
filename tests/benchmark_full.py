@@ -13,7 +13,6 @@ Usage:
 import time
 
 import torch
-import torch.nn.functional as F
 from diffusers.models.attention_dispatch import dispatch_attention_fn
 from torch.nn.attention import (
     activate_flash_attention_impl,
@@ -23,7 +22,7 @@ from torch.nn.attention import (
 )
 from torch.nn.attention.flex_attention import flex_attention as _flex_orig
 
-from model_training.net.transformer import _DEFAULT_ATTENTION_BACKEND, _FLEX_KERNEL_OPTIONS
+from model_training.net.attention_config import configure_attention, flex_block_size
 
 # -------------------------------------------------------------------------
 WARMUP = 10
@@ -33,13 +32,16 @@ SHAPES = [
 ]
 DTYPE = torch.bfloat16
 
-gpu_name = torch.cuda.get_device_name(0)
-cc = torch.cuda.get_device_capability(0)
+device = torch.device("cuda:0")
+torch.cuda.set_device(device)
+attention_backend = configure_attention(device)
+gpu_name = torch.cuda.get_device_name(device)
+cc = torch.cuda.get_device_capability(device)
 print(f"GPU: {gpu_name}  cc: {cc[0]}.{cc[1]}")
 print(f"FA impls: {list_flash_attention_impls()}")
 print(f"Active FA: {current_flash_attention_impl()}")
-print(f"Default dispatch backend: {_DEFAULT_ATTENTION_BACKEND!r}")
-print(f"Flex kernel options: {_FLEX_KERNEL_OPTIONS}")
+print(f"Default dispatch backend: {attention_backend!r}")
+print(f"Flex block size: {flex_block_size()}")
 print()
 
 
@@ -61,6 +63,10 @@ def bench(fn, warmup=WARMUP, iters=ITERS):
 def try_bench(fn):
     try:
         return f"{bench(fn):.2f}"
+    except TypeError:
+        # A TypeError usually means a call in this file no longer matches the
+        # current forward signature. Re-raise it; an ERR row would hide that.
+        raise
     except Exception as e:
         return f"ERR: {str(e)[:40]}"
 
@@ -134,7 +140,11 @@ try:
     restore_flash_attention_impl(_raise_warn=False)
 except Exception:
     pass
-activate_flash_attention_impl("FA4")
+try:
+    activate_flash_attention_impl("FA4")
+except Exception as e:
+    print(f"FA4 activation SKIP: {e} (expected on non-Blackwell GPUs)")
+print(f"Active FA impl for Parts 2-4: {current_flash_attention_impl()}")
 
 
 # =========================================================================
@@ -260,7 +270,7 @@ print("=" * 90)
 
 from diffusers import WanTransformer3DModel
 
-from model_training.net.transformer import ArtifixerTransformerBlock
+from model_training.net.wan_transformer import ArtifixerTransformerBlock
 
 # Build a single block
 transformer = WanTransformer3DModel.from_config(
@@ -277,8 +287,9 @@ transformer = WanTransformer3DModel.from_config(
 )
 
 # Set the attention backend
-if _DEFAULT_ATTENTION_BACKEND is not None:
-    transformer.set_attention_backend(_DEFAULT_ATTENTION_BACKEND)
+attention_backend = configure_attention(device)
+if attention_backend is not None:
+    transformer.set_attention_backend(attention_backend)
 
 base_block = transformer.blocks[0]
 block = (
@@ -286,8 +297,7 @@ block = (
         base_block,
         opacity_embedding_dim=0,
         camera_embedding_dim=0,
-        local_attn_size=None,
-        sink_size=0,
+        use_kv_cache_attention=False,
     )
     .cuda()
     .to(DTYPE)
@@ -308,12 +318,35 @@ rope_cos = torch.randn(1, S_e2e, 1, 128, dtype=DTYPE, device="cuda")
 rope_sin = torch.randn(1, S_e2e, 1, 128, dtype=DTYPE, device="cuda")
 rotary_emb = (rope_cos, rope_sin)
 
-frame_seqlen = 64  # post_patch_height * post_patch_width
-
 print(f"\nBlock config: B={B_e2e} S={S_e2e} heads=40 head_dim=128")
-print(f"Attention backend: {_DEFAULT_ATTENTION_BACKEND!r}")
-print(f"Flex kernel options: {_FLEX_KERNEL_OPTIONS}")
+print(f"Attention backend: {attention_backend!r}")
+print(f"Flex block size: {flex_block_size()}")
 print()
+
+
+# Call with keyword arguments so a change to ArtifixerTransformerBlock.forward's
+# signature raises a TypeError here instead of binding values to the wrong
+# parameters.
+def run_block(hidden_states, block_mask=None):
+    return block(
+        hidden_states=hidden_states,
+        encoder_hidden_states=encoder_hidden,
+        neighbor_hidden_states=None,
+        ignore_neighbors=True,
+        temb=temb,
+        rotary_emb=rotary_emb,
+        opacity_extra_patches=None,
+        camera_extra_patches=None,
+        kv_cache=None,
+        layer_index=0,
+        kv_cache_num_history_chunks=0,
+        kv_cache_stage=None,
+        context_kv_cache=None,
+        prope_target=None,
+        prope_reference=None,
+        block_mask=block_mask,
+    )
+
 
 # Without block_mask (dispatch_attention_fn path only)
 print("--- Without block_mask (dispatch_attention_fn only) ---")
@@ -322,49 +355,12 @@ print("-" * 60)
 
 
 def block_fwd():
-    block(
-        hidden,
-        encoder_hidden,
-        None,
-        temb,
-        rotary_emb,
-        None,
-        None,
-        None,
-        None,
-        None,
-        0,
-        frame_seqlen,
-        None,
-        None,
-        None,
-        None,
-        False,
-    )
+    run_block(hidden)
 
 
 def block_fwd_bwd():
     h = hidden.detach().requires_grad_(True)
-    out = block(
-        h,
-        encoder_hidden,
-        None,
-        temb,
-        rotary_emb,
-        None,
-        None,
-        None,
-        None,
-        None,
-        0,
-        frame_seqlen,
-        None,
-        None,
-        None,
-        None,
-        False,
-    )
-    out.sum().backward()
+    run_block(h).sum().backward()
 
 
 fwd = try_bench(block_fwd)
@@ -388,49 +384,12 @@ print("-" * 60)
 
 
 def block_fwd_mask():
-    block(
-        hidden,
-        encoder_hidden,
-        None,
-        temb,
-        rotary_emb,
-        None,
-        None,
-        None,
-        None,
-        None,
-        0,
-        frame_seqlen,
-        None,
-        None,
-        None,
-        bmask,
-        False,
-    )
+    run_block(hidden, block_mask=bmask)
 
 
 def block_fwd_bwd_mask():
     h = hidden.detach().requires_grad_(True)
-    out = block(
-        h,
-        encoder_hidden,
-        None,
-        temb,
-        rotary_emb,
-        None,
-        None,
-        None,
-        None,
-        None,
-        0,
-        frame_seqlen,
-        None,
-        None,
-        None,
-        bmask,
-        False,
-    )
-    out.sum().backward()
+    run_block(h, block_mask=bmask).sum().backward()
 
 
 fwd = try_bench(block_fwd_mask)

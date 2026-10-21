@@ -21,7 +21,13 @@ class ReconstructionOutputs:
     checkpoint: Path
 
     def complete(self) -> bool:
-        return all(path.is_file() and path.stat().st_size > 0 for path in self.paths())
+        return not self.incomplete_marker.exists() and all(
+            path.is_file() and path.stat().st_size > 0 for path in self.paths()
+        )
+
+    @property
+    def incomplete_marker(self) -> Path:
+        return self.data_h5.with_name(self.data_h5.name + ".incomplete")
 
     def paths(self) -> tuple[Path, Path, Path]:
         return self.data_h5, self.parsed_yaml, self.checkpoint
@@ -78,6 +84,8 @@ def _transfer_reconstruction_outputs(src_dir: Path, outputs: ReconstructionOutpu
         if not src.exists():
             raise FileNotFoundError(src)
 
+    outputs.incomplete_marker.parent.mkdir(parents=True, exist_ok=True)
+    outputs.incomplete_marker.touch()
     for src, dst in mapping:
         dst.parent.mkdir(parents=True, exist_ok=True)
         tmp = dst.with_name(f".{dst.name}.tmp.{os.getpid()}")
@@ -91,6 +99,7 @@ def _transfer_reconstruction_outputs(src_dir: Path, outputs: ReconstructionOutpu
             tmp.unlink(missing_ok=True)
             raise
         print(f"Wrote {dst}")
+    outputs.incomplete_marker.unlink()
 
 
 def task_work_dir(scene_work_dir: Path, half: str, views: int | str) -> Path:

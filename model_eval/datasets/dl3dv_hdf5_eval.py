@@ -9,11 +9,9 @@ Train/test indices are read from the HDF5 file's selected_indices field.
 Rendered images are also read from the HDF5 file.
 """
 
-import io
 from pathlib import Path
 from typing import Any, List, Tuple
 
-import av
 import h5py
 import numpy as np
 import torch
@@ -26,14 +24,8 @@ from model_training.data.utils import (
     generate_inference_pairs,
     visualize_inference_pairs,
 )
-
-
-def _count_video_frames(video_bytes: bytes) -> int:
-    with av.open(io.BytesIO(video_bytes)) as container:
-        stream = container.streams.video[0]
-        if stream.frames:
-            return stream.frames
-        return sum(1 for _ in container.decode(video=0))
+from model_training.prompt_formats import caption_filename_for_format
+from model_training.utils.video_io import probe_video_frame_count
 
 
 class DL3DVHDF5EvalDataset(DL3DVPairedDatasetTest):
@@ -51,7 +43,6 @@ class DL3DVHDF5EvalDataset(DL3DVPairedDatasetTest):
         split_path: Path,
         dl3dv_dir: Path,
         prompt_dir: Path,
-        num_frames: int | None,
         num_views: int,
         dataset_scaling_factor: float,
         frames_per_block: int = 7,
@@ -59,7 +50,10 @@ class DL3DVHDF5EvalDataset(DL3DVPairedDatasetTest):
         max_test_frames: int | None = None,
         include_all_frames: bool = False,
         filter_scene_id: str | None = None,
-        generator: torch.Generator | None = None,
+        resize_multiple: int = 16,
+        *,
+        prompt_format: str,
+        camera_pose_alignment: str = "mean",
         verbose: bool = False,
     ):
         super().__init__(
@@ -67,15 +61,16 @@ class DL3DVHDF5EvalDataset(DL3DVPairedDatasetTest):
             split_path=split_path,
             dl3dv_dir=dl3dv_dir,
             prompt_dir=prompt_dir,
-            num_frames=num_frames,
+            num_frames=None,
             frames_per_block=frames_per_block,
             num_views=num_views,
             dataset_scaling_factor=dataset_scaling_factor,
             max_neighbors=num_views,
-            generator=generator,
             verbose=verbose,
-            start_index=0,
-            skip_vae_check=include_all_frames or max_test_frames is None,
+            resize_multiple=resize_multiple,
+            prompt_format=prompt_format,
+            skip_vae_check=True,
+            camera_pose_alignment=camera_pose_alignment,
         )
 
         self.num_views = num_views
@@ -86,7 +81,7 @@ class DL3DVHDF5EvalDataset(DL3DVPairedDatasetTest):
         for data_idx, data_dict in enumerate(self.data):
             if num_views not in data_dict:
                 raise ValueError(f"num_views {num_views} not found in data_dict (available: {list(data_dict.keys())})")
-            hdf5_path, _ = data_dict[num_views]
+            hdf5_path = data_dict[num_views][0]
             scene_id, half, n_views = parse_reconstruction_hdf5_path(hdf5_path)
 
             if n_views != num_views:
@@ -102,7 +97,7 @@ class DL3DVHDF5EvalDataset(DL3DVPairedDatasetTest):
 
             with h5py.File(hdf5_path, "r") as f:
                 source_train_ids = set(f["selected_indices"][:].tolist())
-                render_total_frames = _count_video_frames(f["render_video"][:].tobytes())
+                render_total_frames = probe_video_frame_count(f["render_video"][:].tobytes())
 
             transforms = self.transforms_by_scene_id[scene_id]
             total_frames = min(len(transforms["frames"]), render_total_frames)
@@ -138,52 +133,71 @@ class DL3DVHDF5EvalDataset(DL3DVPairedDatasetTest):
                 f"(base split contains {len(self.data)} scene entries)"
             )
 
+    def _prompt_paths_for_scene(
+        self, scene_prompt_dir: Path, num_frames: int | None, scene_num_frames: int
+    ) -> list[Path]:
+        """Exactly one caption per scene: the canonical forward-order file, one record.
+
+        The reverse/revisit files next to it are training augmentation; any
+        draw among files or records would tie the caption to the item's
+        position in the job, which changes with sharding. Missing or
+        ambiguous captions fail the run rather than shrink the benchmark.
+        """
+        canonical_prompt_path = scene_prompt_dir / caption_filename_for_format(
+            "frames_all_stride_1.h5", self.prompt_format
+        )
+        if not canonical_prompt_path.exists():
+            raise FileNotFoundError(
+                f"Scene {scene_prompt_dir.name} has no canonical evaluation prompt {canonical_prompt_path} "
+                "(regenerate the scene's prompt files)"
+            )
+        with h5py.File(canonical_prompt_path, "r") as f:
+            num_records = len(f)
+        if num_records != 1:
+            raise ValueError(
+                f"Canonical evaluation prompt {canonical_prompt_path} holds {num_records} caption records; "
+                "evaluation conditions on exactly one"
+            )
+        return [canonical_prompt_path]
+
     def __len__(self) -> int:
         return len(self.inference_items)
 
     def __getitem__(self, idx: int) -> dict[str, Any]:
         data_idx, pair = self.inference_items[idx]
+        # Evaluation samples nothing: construction validated one caption file
+        # with one record per scene, and frame/neighbor indices come from the
+        # pair. The local generator keeps get_item_inner's now-inert draws
+        # from consuming global RNG state.
+        generator = torch.Generator().manual_seed(self.validation_seed + idx)
         item = self.get_item_inner(
             data_idx,
             self.num_views,
             len(pair.neighbor_indices),
             override_frame_indices=pair.test_indices,
             override_neighbor_indices=pair.neighbor_indices,
+            generator=generator,
         )
         item["frame_indices"] = torch.tensor(pair.test_indices, dtype=torch.long)
         item["neighbor_indices"] = torch.tensor(pair.neighbor_indices, dtype=torch.long)
         item["scene_id"] = pair.scene_id
         item["chunk_idx"] = pair.chunk_idx
         # valid_frames_mask: True for actual frames, False for VAE padding (added later by eval script)
-        num_total_frames = item["rgb_gt"].shape[0]
         num_inference_frames = len(pair.test_indices)
-        valid_mask = torch.zeros(num_total_frames, dtype=torch.bool)
-        valid_mask[:num_inference_frames] = True
-        item["valid_frames_mask"] = valid_mask
-
-        # Pad is_test_frame to match num_total_frames (base class may pad frames)
-        if pair.is_test_frame is not None:
-            is_test = torch.tensor(pair.is_test_frame, dtype=torch.bool)
-        else:
-            is_test = torch.ones(num_inference_frames, dtype=torch.bool)
-        # Pad with False for any extra frames added by base class
-        if len(is_test) < num_total_frames:
-            padding = torch.zeros(num_total_frames - len(is_test), dtype=torch.bool)
-            is_test = torch.cat([is_test, padding])
-        item["is_test_frame"] = is_test
-
-        gt_index = torch.full((num_total_frames,), -1, dtype=torch.long)
-        for frame_i, (frame_idx, keep) in enumerate(zip(pair.test_indices, is_test[:num_inference_frames])):
-            if bool(keep):
-                gt_index[frame_i] = int(frame_idx)
-        item["gt_index"] = gt_index
+        item["valid_frames_mask"] = torch.ones(num_inference_frames, dtype=torch.bool)
+        item["is_test_frame"] = (
+            torch.tensor(pair.is_test_frame, dtype=torch.bool)
+            if pair.is_test_frame is not None
+            else torch.ones(num_inference_frames, dtype=torch.bool)
+        )
+        item["gt_index"] = torch.where(item["is_test_frame"], item["frame_indices"], -1)
         return item
 
     def visualize_splits(self, output_path: str | Path | None = None, title: str | None = None) -> None:
         """Visualize train/test splits for this dataset."""
 
         def get_total_frames(data_idx: int) -> int:
-            hdf5_path, _ = next(iter(self.data[data_idx].values()))
+            hdf5_path = next(iter(self.data[data_idx].values()))[0]
             scene_id, _, _ = parse_reconstruction_hdf5_path(hdf5_path)
             return len(self.transforms_by_scene_id[scene_id]["frames"])
 

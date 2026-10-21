@@ -139,11 +139,7 @@ def assert_target_only_trajectory(trajectory: Mapping[str, Any], label: str) -> 
     """Reject combined target/context transforms at the user trajectory boundary."""
     frames = trajectory["frames"]
     assert isinstance(frames, list), f"{label} frames must be a list"
-    source_frames = [
-        index
-        for index, frame in enumerate(frames)
-        if isinstance(frame, Mapping) and "file_path" in frame
-    ]
+    source_frames = [index for index, frame in enumerate(frames) if isinstance(frame, Mapping) and "file_path" in frame]
     assert not source_frames, (
         f"{label} must contain target cameras only; frames with file_path look like source/context images: "
         f"{source_frames[:10]}"
