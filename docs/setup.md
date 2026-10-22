@@ -20,14 +20,14 @@ All tags below use `ghcr.io/nv-tlabs/artifixer:` as their prefix.
 
 | Platform | Tag | Registry digest |
 | --- | --- | --- |
-| CUDA 12, x86 (`linux/amd64`) | `cuda12-ffmpeg-free-20261008-eaf4b814` | `sha256:<CUDA12_DIGEST>` |
-| CUDA 13, x86 (`linux/amd64`) | `cuda13-ffmpeg-free-20261008-eaf4b814` | `sha256:<CUDA13_DIGEST>` |
-| CUDA 13, ARM64 (`linux/arm64`) | `cuda13-aarch64-ffmpeg-free-20261008-eaf4b814` | `sha256:<CUDA13_ARM64_DIGEST>` |
+| CUDA 12, x86 (`linux/amd64`) | `cuda12-ffmpeg-free-20261021-5b1bb939` | `sha256:9c5aa877cbc2ff1be3c06d58296768b88d7ee5ac3ee5b244afc729a1f79a5d23` |
+| CUDA 13, x86 (`linux/amd64`) | `cuda13-ffmpeg-free-20261021-5b1bb939` | `sha256:2c5348ec87a5dd83cc345ca84945591c2252abfd768558ee3fc320d407856d32` |
+| CUDA 13, ARM64 (`linux/arm64`) | `cuda13-aarch64-ffmpeg-free-20261021-5b1bb939` | `sha256:cfe05bf0a9ce3aa9753cc42442c8c30670db117f517665902b795e55c223ed08` |
 
 For an immutable CUDA 12 reference, use:
 
 ```bash
-export ARTIFIXER_IMAGE=ghcr.io/nv-tlabs/artifixer@sha256:<CUDA12_DIGEST>
+export ARTIFIXER_IMAGE=ghcr.io/nv-tlabs/artifixer@sha256:9c5aa877cbc2ff1be3c06d58296768b88d7ee5ac3ee5b244afc729a1f79a5d23
 docker pull --platform linux/amd64 "$ARTIFIXER_IMAGE"
 ```
 
@@ -39,7 +39,7 @@ are available for each image.
 
 ## Hardware
 
-The documented test targets are H100, B200, and GB200. A100 uses PyTorch SDPA
+These image builds were tested on H100 (x86), GB200 and GB300 (ARM64). A100 uses PyTorch SDPA
 instead of FA3. GPU requirements depend on model size, image resolution,
 reference-view count, and the workflow.
 
@@ -61,8 +61,8 @@ The Cosmos3-Nano model has 15.8B transformer parameters: approximately
 31.6 GB of BF16 weights and a 63.2 GB FP32 checkpoint file. Those figures exclude
 the VAE, activations, references, and KV cache; a 24 GB GPU cannot hold the
 transformer alone. The Wan cache estimates above do not describe Cosmos.
-The original Cosmos DCP checkpoint has run on an H100 80 GB; qualification of
-the exported `.pt` file and minimum-VRAM measurements remain pending.
+Both exported Cosmos3-Nano S1 and S3 checkpoints were evaluated on H100 80 GB
+using the DL3DV test set. Minimum-VRAM requirements have not been measured.
 
 Released Wan2.1 inference keeps native frame sizes, snapped to multiples of 16.
 Cosmos3 and Wan2.2 use multiples of 32. Downscale large

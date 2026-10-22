@@ -62,7 +62,7 @@ Prebuilt images are published to the GitHub Container Registry. For CUDA 12 on
 x86:
 
 ```bash
-export ARTIFIXER_IMAGE=ghcr.io/nv-tlabs/artifixer:cuda12-ffmpeg-free-20261008-eaf4b814
+export ARTIFIXER_IMAGE=ghcr.io/nv-tlabs/artifixer:cuda12-ffmpeg-free-20261021-5b1bb939
 docker pull "$ARTIFIXER_IMAGE"
 ```
 

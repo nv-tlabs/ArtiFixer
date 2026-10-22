@@ -153,12 +153,33 @@ Environment values, labels, command, entrypoint, working directory, user,
 exposed ports, stop signal, shell, and platform are preserved and compared.
 The destination tag is assigned only after the resulting image passes.
 
-The image has one filesystem payload. Some Docker versions append a canonical
-empty tar when applying metadata; only that exact content hash is allowed after
-the root layer. Other inherited layers cause rejection. Images with declared
+Release images contain one filesystem payload or disjoint sanitized segments.
+Segmented images must declare each path once, contain no whiteouts or path
+replacements, and keep hardlinks with their targets. Canonical empty metadata
+layers are allowed. Images with declared
 volumes, ONBUILD hooks, or health checks are refused because this workflow does
 not yet preserve and inspect those contracts. Multiline configuration is also
 refused instead of being changed silently.
+
+## Package for GHCR
+
+GHCR has a [10 GB limit per layer](https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-container-registry#troubleshooting).
+For large flattened images, use [regctl](https://regclient.org/install/) to import
+the Docker archive, then package the filesystem into bounded gzip layers:
+
+```bash
+docker image save artifixer:cuda12-candidate-001-flat -o /path/to/flat.tar
+regctl image import ocidir:///path/to/flat:release /path/to/flat.tar
+python3 docker/package_release_image.py /path/to/flat /path/to/distribution \
+    --tag cuda12 --report /path/to/packaging.json
+regctl image export ocidir:///path/to/distribution:cuda12 --name artifixer:cuda12-release | docker load
+python3 docker/release_image.py verify artifixer:cuda12-release \
+    --platform linux/amd64 --report /path/to/distribution-verification.json
+```
+
+Use new output paths for each image. The packaging report binds the source and
+distribution configuration digests and verifies all file bytes and metadata.
+Retain both receipts with the matching component notices and source archives.
 
 ## What the FFmpeg check establishes
 

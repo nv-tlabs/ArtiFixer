@@ -10,6 +10,7 @@ runtime qualification or license clearance.
 
 | Build snapshot | CUDA 12 x86 | CUDA 13 x86 | CUDA 13 ARM64 |
 | --- | --- | --- | --- |
+| `20261021-5b1bb939` | [Notice](20261021-5b1bb939/cuda12.md) | [Notice](20261021-5b1bb939/cuda13.md) | [Notice](20261021-5b1bb939/cuda13-aarch64.md) |
 | `20261008-eaf4b814` | [Notice](20261008-eaf4b814/cuda12.md) | [Notice](20261008-eaf4b814/cuda13.md) | [Notice](20261008-eaf4b814/cuda13-aarch64.md) |
 | `20261007-788a8c5e` | [Notice](20261007-788a8c5e/cuda12.md) | [Notice](20261007-788a8c5e/cuda13.md) | [Notice](20261007-788a8c5e/cuda13-aarch64.md) |
 

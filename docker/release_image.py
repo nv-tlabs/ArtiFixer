@@ -150,14 +150,57 @@ class HashReader:
         return data
 
 
+def member_path(name):
+    path = PurePosixPath(name)
+    if path.is_absolute() or ".." in path.parts:
+        raise ValueError("Unsafe filesystem-layer path")
+    return str(path)
+
+
+def filesystem_layout(layer_records):
+    """Require an append-only filesystem, with no hidden or replaced entries."""
+    seen = {}
+    failures = []
+    for layer in layer_records:
+        local = {}
+        failures.extend(layer.get("_layout_errors", []))
+        for path, kind, target in layer.get("_entries", []):
+            if path in seen:
+                failures.append(f"Repeated filesystem path: {path}")
+            if kind == "hardlink" and local.get(target) not in ("file", "hardlink"):
+                failures.append(f"Hardlink target must precede its link in the same layer: {path}")
+            seen[path] = kind
+            local[path] = kind
+    for path in seen:
+        for parent in PurePosixPath(path).parents:
+            if str(parent) in seen and seen[str(parent)] != "directory":
+                failures.append(f"Filesystem entry has a non-directory ancestor: {path}")
+                break
+    return {"status": "fail" if failures else "pass", "paths": len(seen), "failures": failures[:100]}
+
+
 def scan_layer(stream, predicates):
     """Inspect tar members without extracting or applying runtime mount masks."""
     offenders = []
+    entries, layout_errors = [], []
     count = 0
     with tarfile.open(fileobj=stream, mode="r|") as archive:
         for member in archive:
             count += 1
             name = member.name.rstrip("/").rsplit("/", 1)[-1]
+            try:
+                path = member_path(member.name)
+                if name.startswith(".wh."):
+                    layout_errors.append(f"Whiteout entry: {member.name}")
+                kind = (
+                    "directory"
+                    if member.isdir()
+                    else "hardlink" if member.islnk() else "file" if member.isfile() else "other"
+                )
+                target = member_path(member.linkname) if member.islnk() else ""
+                entries.append((path, kind, target))
+            except ValueError:
+                layout_errors.append(f"Unsafe filesystem path: {member.name}")
             if ".git" in PurePosixPath(member.name).parts or name == ".CI_CONFIG_DO_NOT_PUSH_THIS_FILE_TO_PUBLIC.yaml":
                 offenders.append(member.name)
             if (
@@ -190,7 +233,7 @@ def scan_layer(stream, predicates):
                             for item in wheel.namelist()
                             if predicates["matches"](item.rsplit("/", 1)[-1])
                         )
-    return {"members": count, "offenders": offenders}
+    return {"members": count, "offenders": offenders, "_entries": entries, "_layout_errors": layout_errors}
 
 
 CONFIG_TYPES = {"application/vnd.oci.image.config.v1+json", "application/vnd.docker.container.image.v1+json"}
@@ -389,6 +432,7 @@ def scan_saved_archive(archive, metadata, predicates):
         raise ValueError("Malformed saved Docker manifest")
     bound_paths = set()
     selected_paths = None
+    layouts = {}
     config_paths = {documents[item[0]]["path"] for item in images}
     # containerd's compatibility manifest may describe only its default
     # platform, even though the OCI index exports several cached platforms.
@@ -434,18 +478,25 @@ def scan_saved_archive(archive, metadata, predicates):
         ] != image_config["rootfs"].get("diff_ids"):
             raise ValueError("Saved layer payload hashes do not match their configuration")
         bound_paths.update(image_paths)
+        layouts[image_config_id] = filesystem_layout([layers[path] for path in image_paths])
         if image_config_id == config_id:
             selected_paths = image_paths
     if bound_paths != set(layers):
         raise ValueError("Saved archive contains unauthenticated filesystem layers")
     offenders = [f"{path}:{name}" for path in sorted(layers) for name in layers[path]["offenders"]]
+    # The path sets are verification working state, not a large public receipt.
+    for layer in layers.values():
+        layer.pop("_entries", None)
+        layer.pop("_layout_errors", None)
     return {
-        "status": "fail" if offenders else "pass",
+        "status": "fail" if offenders or any(item["status"] != "pass" for item in layouts.values()) else "pass",
         "scope": "all saved filesystem layer bytes, including /dev, /proc and /sys; known codec names, wheels and repository metadata",
         "configuration_digest": config_id,
         "descriptor_chain": list(chain),
         "layers": [layers[path] for path in selected_paths],
         "additional_layers": [layers[path] for path in sorted(bound_paths - set(selected_paths))],
+        "filesystem_layout": layouts[config_id],
+        "additional_filesystem_layouts": {key: value for key, value in layouts.items() if key != config_id},
         "offenders": offenders,
     }
 
@@ -548,15 +599,16 @@ def verify(image: str, *, require_flat: bool = True, expected_platform: str | No
     assert_exportable(metadata)
     layers = metadata.get("RootFS", {}).get("Layers", [])
     failures = []
-    if require_flat and (not layers or layers[0] == EMPTY_LAYER or any(layer != EMPTY_LAYER for layer in layers[1:])):
-        failures.append(
-            "Release image must have one filesystem payload plus only canonical empty layers; flatten first"
-        )
+    if require_flat and (not layers or layers[0] == EMPTY_LAYER):
+        failures.append("Release image must contain a filesystem payload; flatten first")
     if expected_platform is not None and not platform_matches(expected_platform, platform(metadata)):
         failures.append(f"Expected {expected_platform}, found {platform(metadata)}")
     saved = scan_saved_image(metadata) if require_flat and not failures else None
     if saved and saved["status"] != "pass":
-        failures.append("Saved image payload contains known codec files, package caches or repository metadata")
+        failures.append("Saved image payload failed codec, repository-metadata or filesystem-layout checks")
+    if saved and sum(layer != EMPTY_LAYER for layer in layers) > 1:
+        if saved.get("filesystem_layout", {}).get("status") != "pass":
+            failures.append("Multiple payload layers require disjoint paths without whiteouts or replacements")
     gate_source = GATE.read_bytes()
     name = f"artifixer-verify-{uuid.uuid4().hex}"
     try:
