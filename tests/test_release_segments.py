@@ -102,6 +102,43 @@ def test_segments_preserve_bytes_links_xattrs_and_directory_metadata(packaging, 
     assert final["work"]["mtime"] == "1700000000.123456789"
 
 
+def test_imported_manifest_aliases_package_as_one_image(packaging, tmp_path):
+    source = tmp_path / "source"
+    source_layout(packaging, source)
+    baseline = packaging.package(source, tmp_path / "baseline", 64 * 1024)
+    index = json.loads((source / "index.json").read_text())
+    descriptor = index["manifests"][0]
+    # Actual regctl 0.11.7 Docker import output: one untagged and one named
+    # descriptor, with identical manifest identity and different annotations.
+    descriptor["annotations"] = {"org.opencontainers.image.created": "2026-01-01T00:00:00Z"}
+    index["manifests"].append(
+        descriptor | {"annotations": descriptor["annotations"] | {"org.opencontainers.image.ref.name": "release"}}
+    )
+    (source / "index.json").write_text(json.dumps(index))
+    actual = packaging.package(source, tmp_path / "aliased", 64 * 1024)
+    assert actual == baseline
+
+
+@pytest.mark.parametrize("defect", ["second_manifest", "conflicting_size", "conflicting_media_type"])
+def test_distinct_or_inconsistent_manifest_descriptors_are_rejected(packaging, tmp_path, defect):
+    source = tmp_path / "source"
+    source_layout(packaging, source)
+    index = json.loads((source / "index.json").read_text())
+    descriptor = dict(index["manifests"][0])
+    if defect == "second_manifest":
+        _, manifest = packaging.json_blob(source, descriptor)
+        manifest["annotations"] = {"fixture": "second image"}
+        descriptor = packaging.write_json_blob(source, manifest, descriptor["mediaType"])
+    elif defect == "conflicting_size":
+        descriptor["size"] += 1
+    else:
+        descriptor["mediaType"] = packaging.OCI + "index.v1+json"
+    index["manifests"].append(descriptor)
+    (source / "index.json").write_text(json.dumps(index))
+    with pytest.raises(ValueError, match="one platform/image"):
+        packaging.package(source, tmp_path / "target", 64 * 1024)
+
+
 @pytest.mark.parametrize("defect", ["duplicate", "whiteout", "oversized"])
 def test_unsafe_or_unrepresentable_sources_do_not_produce_a_release(packaging, tmp_path, defect):
     source, target = tmp_path / "source", tmp_path / "target"

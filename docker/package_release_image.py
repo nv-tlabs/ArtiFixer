@@ -260,9 +260,12 @@ class Segments:
 
 def inspect_layout(layout):
     index = json.loads((Path(layout) / "index.json").read_text())
-    if len(index.get("manifests", [])) != 1:
+    # regctl import can retain both an untagged descriptor and a named alias.
+    # Ignore annotation differences, but never mask conflicting blob metadata.
+    descriptors = {(item["digest"], item["size"], item["mediaType"]): item for item in index.get("manifests", [])}
+    if len(descriptors) != 1:
         raise ValueError("Package one platform/image at a time")
-    _, manifest = json_blob(layout, index["manifests"][0])
+    _, manifest = json_blob(layout, next(iter(descriptors.values())))
     if manifest["mediaType"] != OCI + "manifest.v1+json":
         raise ValueError("Source must contain an OCI image manifest")
     raw_config, config = json_blob(layout, manifest["config"])

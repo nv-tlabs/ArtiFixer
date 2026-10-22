@@ -119,7 +119,9 @@ def main():
 
     check("build-filesystem", "verify", source_id, "--build-image")
     rejected = check("deleted-layer", "verify", source_id, expected=1)
-    assert rejected["gate"]["status"] == "pass" and rejected["saved_payload"] is None
+    assert rejected["gate"]["status"] == "pass"
+    assert rejected["saved_payload"]["status"] == "fail"
+    assert any("usr/local/lib/libavcodec.so.fixture" in path for path in rejected["saved_payload"]["offenders"])
     flattened = check("flatten", "flatten", source_id, flat)
     assert flattened["source_image_id"] == source_id
     assert flattened["saved_payload"]["status"] == "pass"
