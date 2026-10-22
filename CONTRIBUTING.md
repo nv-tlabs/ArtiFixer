@@ -61,3 +61,32 @@ By making a contribution to this project, I certify that:
     maintained indefinitely and may be redistributed consistent with
     this project or the open source license(s) involved.
 ```
+
+## Development and testing
+
+Use the [project environment](docs/setup.md) and install pytest. From the
+repository root, run:
+
+```bash
+python -m pytest tests -q
+python -m black --check .
+python -m isort --check-only .
+```
+
+Black 24.8.0 and isort 5.13.2 are pinned in `docker/requirements.txt`; settings
+are in [pyproject.toml](pyproject.toml). Keep CPU-runnable `slow` tests in the
+full run. `-m 'not slow'` provides quicker feedback but is only a subset.
+
+The suite needs ShellCheck on `PATH` and Cosmos3-Nano tokenizer assets at the
+revision in [pins.py](model_training/pins.py). Tokenizer parity needs no model
+weights. Video tests need [host FFmpeg](docs/setup.md#ffmpeg). Pretrained LPIPS
+comparison also needs `lpips==0.1.4` and its model weights.
+
+Report failures and skips explicitly. A CPU run skips CUDA cases, and ordinary
+pytest does not cover the standalone distributed or smoke commands. See the
+[testing reference](docs/testing.md) for assets, four-process normalization, GPU
+checks, and smoke runs. Match verification to the changed behavior; skipped
+checks are not passes.
+
+Inside Slurm, run the single-process suite without inherited `SLURM_*`,
+`PMI_*`, or `PMIX_*` variables; they can make Accelerate initialize distributed mode.

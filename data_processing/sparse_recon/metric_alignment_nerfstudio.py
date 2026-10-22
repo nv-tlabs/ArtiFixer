@@ -20,18 +20,14 @@ import logging
 import os
 from pathlib import Path
 
-import cv2
 import numpy as np
-import torch
 
 from data_processing.sparse_recon.metric_alignment import (
     MoGeModelWrapper,
-    create_error_heatmap,
-    plot_depth_correlation,
+    debug_report,
+    extract_monodepth_depths,
     read_colmap_points3D_binary,
-    sanity_checks,
     solve_scale_factor,
-    visualize_depth_comparison,
 )
 
 logger = logging.getLogger(__name__)
@@ -40,7 +36,7 @@ logger.addHandler(logging.StreamHandler())
 
 
 def read_nerfstudio_transforms(transforms_path):
-    """Read camera intrinsics, poses, and applied_transform from nerfstudio transforms.json."""
+    """Read camera intrinsics and poses from nerfstudio transforms.json."""
     with open(transforms_path) as f:
         data = json.load(f)
 
@@ -92,8 +88,7 @@ def read_nerfstudio_transforms(transforms_path):
             }
         )
 
-    # Return None for applied_transform since it's already applied to poses
-    return intrinsics, frames, None
+    return intrinsics, frames
 
 
 def project_points_to_frame(points3D, frame, intrinsics):
@@ -127,7 +122,22 @@ def project_points_to_frame(points3D, frame, intrinsics):
     return x[valid], y[valid], depths[valid]
 
 
-def extract_projected_depths(frames, intrinsics, points3D, image_dir, downsample_factor=1.0):
+def filter_occluded_points(x, y, depths, intrinsics, cell_size=8, depth_tolerance=1.1):
+    """Approximate z-buffer visibility test for projected points.
+
+    Keeps only points whose depth is close to the minimum projected depth within
+    their local pixel cell; points well behind that minimum are likely occluded
+    and must not be paired with monocular depth of the occluder.
+    """
+    grid_w = (int(intrinsics["w"]) + cell_size - 1) // cell_size
+    grid_h = (int(intrinsics["h"]) + cell_size - 1) // cell_size
+    cells = (y.astype(int) // cell_size) * grid_w + (x.astype(int) // cell_size)
+    min_depths = np.full(grid_w * grid_h, np.inf)
+    np.minimum.at(min_depths, cells, depths)
+    return depths <= min_depths[cells] * depth_tolerance
+
+
+def extract_projected_depths(frames, intrinsics, points3D, image_dir):
     """Extract COLMAP depths by projecting all 3D points to each frame."""
     correspondences = []
 
@@ -144,8 +154,14 @@ def extract_projected_depths(frames, intrinsics, points3D, image_dir, downsample
             logger.warning(f"Image not found: {image_path}")
             continue
 
-        # Project all 3D points to this frame
+        # Project all 3D points to this frame and drop occluded ones
         x, y, depths_colmap = project_points_to_frame(points3D, frame, intrinsics)
+
+        if len(depths_colmap) == 0:
+            continue
+
+        visible = filter_occluded_points(x, y, depths_colmap, intrinsics)
+        x, y, depths_colmap = x[visible], y[visible], depths_colmap[visible]
 
         if len(depths_colmap) == 0:
             continue
@@ -165,37 +181,6 @@ def extract_projected_depths(frames, intrinsics, points3D, image_dir, downsample
                 },
             }
         )
-
-    return correspondences
-
-
-def extract_monodepth_depths(correspondences, monodepth_model, downsample_factor=1.0):
-    """Extract monodepth predictions at projected point locations."""
-    for corr in correspondences:
-        image_path = corr["image_path"]
-
-        input_image = cv2.cvtColor(cv2.imread(image_path), cv2.COLOR_BGR2RGB)
-        input_image = torch.tensor(input_image / 255, dtype=torch.float32, device="cuda").permute(2, 0, 1)
-
-        pred_depth, mask, _ = monodepth_model(input_image)
-        pred_depth = pred_depth.cpu().numpy()
-        mask = mask.cpu().numpy()
-
-        if mask.ndim > 2:
-            mask = mask.squeeze()
-
-        # Sample depths at point locations
-        # (xys are already in downsampled image coordinates since intrinsics were scaled)
-        xys = corr["xys"]
-        depth_h, depth_w = pred_depth.shape
-        x_idx = np.clip(xys[:, 0].astype(int), 0, depth_w - 1)
-        y_idx = np.clip(xys[:, 1].astype(int), 0, depth_h - 1)
-
-        depths_metric = pred_depth[y_idx, x_idx]
-        mask_sampled = mask[y_idx, x_idx]
-
-        corr["depths_metric"] = depths_metric
-        corr["mask"] = mask_sampled
 
     return correspondences
 
@@ -250,15 +235,9 @@ def align_nerfstudio_to_metric_scale(
     if not image_dir.exists():
         raise FileNotFoundError(f"Image directory not found: {image_dir}")
 
-    # Setup debug directory
-    if debug and output_dir:
-        debug_dir = Path(output_dir) / "debug_visualizations"
-        debug_dir.mkdir(parents=True, exist_ok=True)
-        logger.info(f"Debug visualizations will be saved to: {debug_dir}")
-
     # Load data
     logger.info("Loading nerfstudio transforms...")
-    intrinsics, frames, applied_transform = read_nerfstudio_transforms(transforms_path)
+    intrinsics, frames = read_nerfstudio_transforms(transforms_path)
     logger.info(f"Loaded {len(frames)} frames")
     logger.info(f"Original intrinsics: {intrinsics['w']}x{intrinsics['h']}, fx={intrinsics['fl_x']:.1f}")
 
@@ -281,13 +260,14 @@ def align_nerfstudio_to_metric_scale(
 
     # Extract projected depths
     logger.info(f"Projecting 3D points to {len(frames)} frames...")
-    correspondences = extract_projected_depths(frames, intrinsics, points_xyz, str(image_dir), downsample_factor)
+    correspondences = extract_projected_depths(frames, intrinsics, points_xyz, str(image_dir))
     logger.info(f"Found {len(correspondences)} frames with valid projections")
 
-    # Run monodepth
+    # Run monodepth. xys are already in downsampled image coordinates (the
+    # intrinsics were scaled above), so no further coordinate scaling is needed.
     logger.info("\nRunning monodepth...")
     monodepth_model = MoGeModelWrapper()
-    correspondences = extract_monodepth_depths(correspondences, monodepth_model, downsample_factor)
+    correspondences = extract_monodepth_depths(correspondences, monodepth_model, downsample_factor=1.0)
 
     # Filter out inf/nan values from metric depths
     for corr in correspondences:
@@ -298,14 +278,6 @@ def align_nerfstudio_to_metric_scale(
             corr["xys"] = corr["xys"][valid]
             if corr.get("mask") is not None:
                 corr["mask"] = corr["mask"][valid]
-
-    # Debug visualizations
-    if debug and output_dir:
-        logger.info("\nCreating depth comparison visualizations...")
-        num_viz = min(10, len([c for c in correspondences if c.get("depths_metric") is not None]))
-        # Pass downsample_factor=1.0 since xys are already in downsampled coordinates
-        # (we project using scaled intrinsics, unlike metric_alignment.py which uses COLMAP's full-res xys)
-        visualize_depth_comparison(correspondences, debug_dir, num_samples=num_viz, downsample_factor=1.0)
 
     # Solve for scale
     logger.info("\nSolving for scale factor...")
@@ -318,12 +290,11 @@ def align_nerfstudio_to_metric_scale(
     logger.info(f"  Median error: {stats['median_error']:.4f}")
     logger.info(f"  Correspondences: {stats['num_correspondences']}")
 
-    # More debug visualizations
     if debug and output_dir:
-        logger.info("\nCreating correlation plots...")
-        plot_depth_correlation(correspondences, scale, debug_dir / "depth_correlation.png")
-        create_error_heatmap(correspondences, scale, debug_dir)
-        sanity_checks(correspondences, scale, stats)
+        debug_dir = Path(output_dir) / "debug_visualizations"
+        logger.info(f"\nWriting debug report to {debug_dir}")
+        # xys are already in downsampled coordinates (intrinsics were scaled above), so downsample_factor=1.0.
+        debug_report(correspondences, scale, stats, debug_dir, num_samples=10)
 
     # Save scale info
     if output_dir:

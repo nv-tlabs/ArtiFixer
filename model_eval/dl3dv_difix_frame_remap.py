@@ -3,11 +3,11 @@
 
 """DiFix frame-space remapping for DL3DV eval.
 
-DiFix train ids and visibility masks were generated against the compact
-DL3DV-Benchmark/nerfstudio frame lists. Release eval reads DL3DV-ALL-960P,
-whose zips still contain a few frames that the DiFix frame space excludes.
-Dropping those frames before indexing keeps render ids, train ids, masks, and
-GT images in the same compact coordinate system.
+DiFix train ids and visibility masks were generated against a compact DiFix
+frame list. Release eval reads DL3DV-ALL-960P, whose zips still contain a few
+frames that the DiFix frame space excludes. Dropping those frames before
+indexing keeps render ids, train ids, masks, and GT images in the same compact
+coordinate system.
 """
 
 from __future__ import annotations
@@ -17,7 +17,6 @@ import os
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
-
 
 DEFAULT_DIFIX_FRAME_REMAP_PATH = (
     Path(__file__).resolve().parents[1] / "data_processing" / "dl3dv_difix_frame_remap.json"
@@ -44,8 +43,8 @@ def load_difix_frame_remap(remap_path: Path = DEFAULT_DIFIX_FRAME_REMAP_PATH) ->
 def apply_difix_frame_remap(transforms: dict[str, Any], scene_id: str) -> dict[str, Any]:
     """Return transforms in DiFix's compact frame space.
 
-    The operation is idempotent: extracted Benchmark nerfstudio transforms have
-    already dropped these frames, while DL3DV-ALL-960P zip transforms have not.
+    The operation is idempotent: compact DiFix transforms have already dropped
+    these frames, while DL3DV-ALL-960P zip transforms have not.
     """
 
     dropped_basenames = load_difix_frame_remap().get(scene_id)

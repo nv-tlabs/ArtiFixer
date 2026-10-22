@@ -9,9 +9,11 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(REPO_ROOT / "thirdparty" / "3DGRUT-ArtiFixer"))
+THREEDGRUT_ROOT = REPO_ROOT / "thirdparty" / "3DGRUT-ArtiFixer"
+if not (THREEDGRUT_ROOT / "threedgrut").is_dir():
+    raise unittest.SkipTest("thirdparty/3DGRUT-ArtiFixer is not initialized")
+sys.path.insert(0, str(THREEDGRUT_ROOT))
 
 from threedgrut.datasets.dataset_colmap import load_mask_image_tensor
 

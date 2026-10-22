@@ -11,9 +11,11 @@ import json
 import shutil
 from pathlib import Path
 
+from PIL import Image
 from threedgrut.render import Renderer
 
 from data_processing.camera_trajectories import write_json
+from model_training.utils.video_io import atomic_output_path
 
 RENDER_FRAME_DIRS = ("renders", "opacity")
 
@@ -28,6 +30,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--num_selected_indices", type=int, default=None)
     parser.add_argument("--downsample_factor", type=float, default=None)
     parser.add_argument("--render_dataset_dir", type=Path, default=None)
+    parser.add_argument(
+        "--trajectory_output_subdir",
+        default=None,
+        help="Output subdirectory for trajectory frames; defaults to the trajectory filename stem. Use '' for the checkpoint root.",
+    )
     parser.add_argument(
         "--trajectory_path",
         type=Path,
@@ -59,7 +66,21 @@ def selected_indices_for_render(selected_indices: Path, num_selected_indices: in
 
 def write_selected_indices(output_dir: Path, selected_indices: Path, num_selected_indices: int | None) -> None:
     indices = selected_indices_for_render(selected_indices, num_selected_indices)
-    write_json(output_dir / "selected_indices.json", indices)
+    with atomic_output_path(output_dir / "selected_indices.json") as temporary:
+        write_json(temporary, indices)
+
+
+def render_frames_complete(output_dir: Path, frame_count: int) -> bool:
+    try:
+        for name in RENDER_FRAME_DIRS:
+            for index in range(frame_count):
+                with Image.open(output_dir / name / f"{index:05d}.png") as image:
+                    if image.format != "PNG":
+                        return False
+                    image.verify()
+    except (OSError, SyntaxError, ValueError):
+        return False
+    return frame_count > 0
 
 
 def render_outputs_complete(
@@ -71,18 +92,17 @@ def render_outputs_complete(
     selected_indices_path = output_dir / "selected_indices.json"
     if not selected_indices_path.is_file():
         return False
-    if expected_selected_indices is not None:
+    try:
         existing_indices = json.loads(selected_indices_path.read_text())
-        if existing_indices != expected_selected_indices:
-            return False
-    return all(
-        (output_dir / dirname).is_dir()
-        and all((output_dir / dirname / f"{index:05d}.png").is_file() for index in range(frame_count))
-        for dirname in RENDER_FRAME_DIRS
-    )
+    except (OSError, ValueError):
+        return False
+    if expected_selected_indices is not None and existing_indices != expected_selected_indices:
+        return False
+    return render_frames_complete(output_dir, frame_count)
 
 
 def reset_render_frame_dirs(output_dir: Path) -> None:
+    (output_dir / "selected_indices.json").unlink(missing_ok=True)
     for name in ("renders", "opacity", "depth"):
         path = output_dir / name
         if path.exists():
@@ -167,6 +187,7 @@ def main() -> None:
         downsample_factor=args.downsample_factor,
         render_dataset_dir=args.render_dataset_dir,
         trajectory_path=args.trajectory_path,
+        trajectory_output_subdir=args.trajectory_output_subdir,
     )
 
 

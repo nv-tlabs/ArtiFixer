@@ -5,7 +5,7 @@ import torch
 
 
 def invert_SE3(transforms: torch.Tensor) -> torch.Tensor:
-    """Invert a 4x4 SE(3) matrix."""
+    """Invert a 4x4 transform containing a rotation and a position."""
     assert transforms.shape[-2:] == (4, 4)
     Rinv = transforms[..., :3, :3].transpose(-1, -2)
     out = torch.zeros_like(transforms)

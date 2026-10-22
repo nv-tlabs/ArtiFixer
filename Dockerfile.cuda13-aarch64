@@ -3,9 +3,18 @@
 
 # CUDA 13 aarch64 — GB200 (Grace ARM64 + Blackwell GPU, sm_100 / sm_121)
 # NGC 26.03-py3 ships torch 2.11 + CUDA 13.2 natively for aarch64.
-FROM nvcr.io/nvidia/pytorch:26.03-py3
+ARG ARTIFIXER_BASE_IMAGE=nvcr.io/nvidia/pytorch:26.03-py3
+FROM ${ARTIFIXER_BASE_IMAGE}
+
+# Never populate pip's download cache: cached wheels keep their bytes in the
+# image even after uninstalling (checked by the compliance gate).
+ENV PIP_NO_CACHE_DIR=1
+# Override the obsolete pypi.ngc.nvidia.com index inherited from older NGC
+# images. Use the current public NVIDIA index; host pip settings are unchanged.
+ENV PIP_EXTRA_INDEX_URL=https://pypi.nvidia.com
 
 ENV DEBIAN_FRONTEND=noninteractive
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 # fused-ssim compiles during the build; default to one job to avoid QEMU segfaults in aarch64 cross-builds.
 ARG FUSED_SSIM_MAX_JOBS=1
 
@@ -15,44 +24,101 @@ RUN apt-get update && apt-get install -y -qq --no-install-recommends \
 
 RUN truncate -s 0 /etc/pip/constraint.txt || true
 RUN pip uninstall -y flash-attn opencv-python || true
-RUN rm -rf /usr/local/lib/python3.12/dist-packages/cv2*
+RUN rm -rf /usr/local/lib/python3.*/dist-packages/cv2*
+
+# Released images must not distribute ffmpeg codecs. The opencv wheels on PyPI
+# statically link ffmpeg, so build opencv from source with video I/O disabled;
+# the wheel is installed as the image's only cv2 at the end of this file.
+# Under QEMU cross-builds this step is slow; prefer building on a native arm64
+# host, or lower OPENCV_BUILD_JOBS if the emulated compiler segfaults.
+ARG OPENCV_VERSION=4.12.0.88
+ARG OPENCV_BUILD_JOBS=4
+RUN CMAKE_ARGS="-DWITH_FFMPEG=OFF -DWITH_GSTREAMER=OFF" \
+    CMAKE_BUILD_PARALLEL_LEVEL=${OPENCV_BUILD_JOBS} \
+    pip wheel --no-deps --no-binary opencv-python-headless \
+    "opencv-python-headless==${OPENCV_VERSION}" -w /opt/ffmpeg-free-wheels
+
+# imageio-ffmpeg platform wheels bundle an ffmpeg binary; the sdist ships none
+# and resolves ffmpeg from the host at runtime (IMAGEIO_FFMPEG_EXE, then PATH).
+RUN pip install --no-binary imageio-ffmpeg "imageio-ffmpeg==0.6.0"
 
 WORKDIR /workspace
 COPY ./thirdparty/ ./thirdparty/
 
 WORKDIR ./thirdparty/3DGRUT-ArtiFixer/
-# Strip packages unavailable or broken on aarch64 in the upstream 3DGRUT requirements.
-RUN sed -i '/^setuptools/d; /^usd-core/d; /^slangtorch/d; /^libigl/d; /^git+.*fused-ssim/d' requirements.txt
+# Strip packages unavailable or broken on aarch64 in the upstream 3DGRUT requirements,
+# plus the opencv-python pin that would reinstall the ffmpeg-bundled wheel.
+RUN sed -i '/^setuptools/d; /^usd-core/d; /^slangtorch/d; /^libigl/d; /^git+.*fused-ssim/d; /^opencv-python/d; /^plyfile/d' requirements.txt
 RUN pip install -r requirements.txt
 RUN MAX_JOBS=${FUSED_SSIM_MAX_JOBS} pip install --no-build-isolation "fused_ssim @ git+https://github.com/rahul-goel/fused-ssim@1272e21a282342e89537159e4bad508b19b34157"
 # Install native aarch64 slangc (slangtorch ships x86-only binaries)
 RUN bash scripts/install_slangc.sh /usr/local
 RUN pip install -e .
 
-# FA4 — CuTeDSL kernels with [cu13] extra for sm_121 (GB200)
-RUN pip install --pre "flash-attn-4[cu13]"
-
-# flash-attn-4 pulls nvidia-cutlass-dsl 4.5.0.dev0 which is broken on aarch64
-# (missing compiled MLIR extensions). Downgrade to 4.4.2 which has them.
-RUN pip install --force-reinstall \
-    nvidia-cutlass-dsl==4.4.2 \
-    nvidia-cutlass-dsl-libs-base==4.4.2 \
-    "nvidia-cutlass-dsl-libs-cu13>=4.4.2"
-
-# cutlass-dsl 4.4.2 needs cuda.bindings.driver from cuda-python 13.x.
-# NGC 26.03 has CUDA 13.2 runtime so 13.x works natively on aarch64.
+# FA4 with a compatible, explicitly pinned QuACK/CUTLASS stack. Stable
+# CUTLASS 4.5.1 supplies native ARM extensions; the old 4.5 dev wheel did not.
+# Remove NGC's monolithic distribution before installing the split libraries:
+# pip otherwise installs the libraries first, then deletes their shared files
+# while uninstalling the old distribution. Metadata checks cannot detect that.
+RUN pip uninstall -y nvidia-cutlass-dsl nvidia-cutlass-dsl-libs-base \
+    nvidia-cutlass-dsl-libs-cu12 nvidia-cutlass-dsl-libs-cu13 nvidia-cutlass-dsl-libs-core
+RUN pip install "flash-attn-4[cu13]==4.0.0b12" "nvidia-cutlass-dsl[cu13]==4.5.1" "quack-kernels==0.4.1"
 RUN pip install --force-reinstall cuda-python==13.2.0 cuda-bindings==13.2.0
 
-RUN pip install accelerate==1.13.0 diffusers==0.37.1 transformers==5.5.0 ftfy
-
 WORKDIR /workspace
-RUN pip install einops scipy wandb tqdm Pillow matplotlib opencv-python-headless \
-    pyyaml torchmetrics imageio-ffmpeg h5py av torch-fidelity \
-    git+https://github.com/microsoft/MoGe.git
+COPY docker/requirements.txt /tmp/requirements.txt
+RUN pip install -r /tmp/requirements.txt
+
+# Transitive dependencies (e.g. MoGe -> opencv-python) may have pulled the
+# ffmpeg-bundled opencv wheels back in; replace every cv2 with the
+# WITH_FFMPEG=OFF build produced above.
+RUN pip uninstall -y opencv-python opencv-python-headless opencv-contrib-python || true && \
+    rm -rf /usr/local/lib/python3.*/dist-packages/cv2* && \
+    pip install --no-deps /opt/ffmpeg-free-wheels/opencv_python_headless-*.whl && \
+    rm -rf /opt/ffmpeg-free-wheels
+
+# Install MoGe from a pinned, documented packaging-only patch so it requires
+# the headless distribution above. Retain its exact modified source in-image.
+COPY docker/install_moge.sh /tmp/install_moge.sh
+RUN bash /tmp/install_moge.sh && rm /tmp/install_moge.sh
+
+# NGC also ships unrelated applications pinned to older NumPy releases. Remove
+# those and their dependents, refusing to remove any project dependency.
+COPY docker/prune_ngc_extras.py /tmp/prune_ngc_extras.py
+RUN python /tmp/prune_ngc_extras.py /tmp/requirements.txt /workspace/thirdparty/3DGRUT-ArtiFixer/requirements.txt
+
+# DALI (preinstalled in NGC base images) bundles ffmpeg demux/decode libraries
+# (libavcodec, libavformat, ...), and the base's torchaudio can carry codec
+# integrations the filename scan cannot see. Nothing in this repo uses either;
+# remove both.
+# Also drop the NGC base's orphaned opencv C++ libs and dist metadata: they
+# contain no ffmpeg code, but a stale `opencv` entry in pip list plus a
+# libopencv_videoio.so on disk would mislead release audits.
+RUN (pip list --format=freeze 2>/dev/null | grep -iE '^nvidia-dali|^torchaudio' | cut -d= -f1 | xargs -r pip uninstall -y) || true && \
+    rm -rf /usr/local/lib/python3.*/dist-packages/nvidia/dali* \
+           /usr/local/lib/python3.*/dist-packages/torchaudio* \
+           /usr/local/lib/libopencv* \
+           /usr/local/lib/python3.*/dist-packages/opencv-*.dist-info
+
+# The NGC base ships a pre-populated pip cache; PIP_NO_CACHE_DIR only prevents
+# new writes, so drop the inherited one for the gate's empty-cache check.
+RUN rm -rf /root/.cache/pip
+RUN python -m pip check
 
 COPY tests/test_flash_attn.py /workspace/test_flash_attn.py
 RUN python -c "import torch; print('torch:', torch.__version__, 'cuda:', torch.version.cuda)"
 RUN pip show nvidia-cutlass-dsl | grep Version && echo 'cutlass-dsl ok'
-RUN pip show flash-attn-4 | grep Version && echo 'FA4 ok'
+RUN pip show flash-attn-4 | grep Version && python -c "import flash_attn.cute; print('FA4 ok')"
 RUN python -c "import cv2; print('cv2 ok:', cv2.__version__)"
 RUN python -c "from moge.model.v2 import MoGeModel; print('MoGe ok')"
+
+# Final-filesystem codec check (distribution also requires flattening): the image must contain no ffmpeg codecs. If the NGC
+# base image ships libav/ffmpeg, this fails the build — remove those packages
+# above rather than weakening the check.
+# NGC bases retain Git metadata and an internal build configuration. Neither is
+# needed at runtime or belongs in the flattened distribution.
+RUN find / -xdev \( -name .git -o -name .CI_CONFIG_DO_NOT_PUSH_THIS_FILE_TO_PUBLIC.yaml \) \
+    -prune -exec rm -rf -- {} +
+
+COPY tests/assert_no_ffmpeg_in_image.py /workspace/assert_no_ffmpeg_in_image.py
+RUN python /workspace/assert_no_ffmpeg_in_image.py --json

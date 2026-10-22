@@ -22,8 +22,6 @@ echo "================================================================"
 
 python -c "import torch; print(f'GPUs: {torch.cuda.device_count()}, {torch.cuda.get_device_name()}')"
 
-pip install pytest -q 2>&1 | tail -1
-
 torchrun --nproc_per_node="${NUM_GPUS}" -m pytest tests/test_cp_attention.py -v -x 2>&1
 
 echo "================================================================"

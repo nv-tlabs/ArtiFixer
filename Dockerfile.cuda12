@@ -2,55 +2,148 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # CUDA 12 x86 — Hopper (H100, sm_90) and Blackwell (B200, sm_100)
-FROM nvcr.io/nvidia/pytorch:25.01-py3
+ARG ARTIFIXER_BASE_IMAGE=nvcr.io/nvidia/pytorch:25.01-py3
+FROM ${ARTIFIXER_BASE_IMAGE}
+
+# Never populate pip's download cache: cached wheels keep their bytes in the
+# image even after uninstalling (checked by the compliance gate).
+ENV PIP_NO_CACHE_DIR=1
+# Override the obsolete pypi.ngc.nvidia.com index inherited from older NGC
+# images. Use the current public NVIDIA index; host pip settings are unchanged.
+ENV PIP_EXTRA_INDEX_URL=https://pypi.nvidia.com
 
 ENV DEBIAN_FRONTEND=noninteractive
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
-ARG FLASH_ATTN_MAX_JOBS=16
-ARG FLASH_ATTN_NVCC_THREADS=2
 RUN apt-get update && apt-get install -y -qq --no-install-recommends \
     wget git curl build-essential gcc-11 g++-11 libgl1-mesa-dev libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
-RUN pip install torch==2.11.0 torchvision --index-url https://download.pytorch.org/whl/cu128
+RUN pip install torch==2.11.0 torchvision==0.26.0 --index-url https://download.pytorch.org/whl/cu128
 RUN pip uninstall -y flash-attn opencv-python || true
-RUN rm -rf /usr/local/lib/python3.12/dist-packages/cv2*
+RUN rm -rf /usr/local/lib/python3.*/dist-packages/cv2*
+
+# The attention kernels come first: they depend only on torch and the
+# toolchain, so later changes to the repository or its requirements reuse
+# these cached layers instead of recompiling FA3.
+#
+# FlashAttention-3 (Dao-AILab Hopper kernels) is compiled from source and is by
+# far the slowest step. It is only used on sm_90 (H100): A100, B200 and
+# RTX PRO 6000 run attention through PyTorch SDPA and never import it, so pass
+# --build-arg BUILD_FLASH_ATTN_3=0 there. An H100 running an image built without
+# FA3 falls back to SDPA (same results, slower attention). The ARGs are declared
+# here, not at the top: a build-arg enters the cache key of every later RUN, so
+# toggling them must not rebuild the toolchain and torch layers above.
+ARG BUILD_FLASH_ATTN_3=1
+ARG FLASH_ATTN_MAX_JOBS=16
+ARG FLASH_ATTN_NVCC_THREADS=2
+# FA3 pinned to a fixed flash-attention commit so rebuilds are reproducible.
+# Installs flash_attn_3 package + flash_attn_interface (top-level) + torch.ops.flash_attn_3
+# Filter ptxas output to stay under Docker's 2MB log limit per step
+RUN if [ "${BUILD_FLASH_ATTN_3}" = "1" ]; then \
+        git init /tmp/flash-attention && cd /tmp/flash-attention && \
+        git remote add origin https://github.com/Dao-AILab/flash-attention.git && \
+        git fetch --depth 1 origin 77aacb68d194ba9af1010eda5eac3e7c0df8e6f6 && \
+        git checkout FETCH_HEAD && \
+        cd /tmp/flash-attention/hopper && \
+        MAX_JOBS=${FLASH_ATTN_MAX_JOBS} \
+        NVCC_THREADS=${FLASH_ATTN_NVCC_THREADS} \
+        pip install . 2>&1 | awk '!/^ptxas info/' && \
+        cd / && rm -rf /tmp/flash-attention; \
+    else \
+        echo "BUILD_FLASH_ATTN_3=0: skipping the FlashAttention-3 build (Hopper-only kernels; SDPA is used instead)"; \
+    fi
+
+# FA4 — CuTeDSL kernels for Hopper+Blackwell (flash_attn.cute); exact
+# pre-release pin = the version the deployed images carry. flash-attn-4 leaves
+# nvidia-cutlass-dsl unpinned and 4.6+ changed the cute.core API it imports
+# (and needs cuda-python >= 12.8), so pin the release it was built against.
+RUN pip install flash-attn-4==4.0.0b12 nvidia-cutlass-dsl==4.5.0.dev0
+
+# Install the namespace package and its matching compiled driver bindings.
+# These satisfy both Torch and CUTLASS; the old 12.6 monolithic pin did not.
+RUN pip install --force-reinstall cuda-python==12.9.4 cuda-bindings==12.9.4
+
+# Released images must not distribute ffmpeg codecs. The opencv wheels on PyPI
+# statically link ffmpeg, so build opencv from source with video I/O disabled;
+# the wheel is installed as the image's only cv2 at the end of this file.
+ARG OPENCV_VERSION=4.12.0.88
+ARG OPENCV_BUILD_JOBS=16
+RUN CMAKE_ARGS="-DWITH_FFMPEG=OFF -DWITH_GSTREAMER=OFF" \
+    CMAKE_BUILD_PARALLEL_LEVEL=${OPENCV_BUILD_JOBS} \
+    pip wheel --no-deps --no-binary opencv-python-headless \
+    "opencv-python-headless==${OPENCV_VERSION}" -w /opt/ffmpeg-free-wheels
+
+# imageio-ffmpeg platform wheels bundle an ffmpeg binary; the sdist ships none
+# and resolves ffmpeg from the host at runtime (IMAGEIO_FFMPEG_EXE, then PATH).
+RUN pip install --no-binary imageio-ffmpeg "imageio-ffmpeg==0.6.0"
 
 WORKDIR /workspace
 COPY ./thirdparty/ ./thirdparty/
 
 WORKDIR ./thirdparty/3DGRUT-ArtiFixer/
+# The upstream opencv-python pin would reinstall the ffmpeg-bundled wheel.
+RUN sed -i '/^opencv-python/d; /^plyfile/d' requirements.txt
 RUN pip install -r requirements.txt
 RUN bash scripts/install_slangc.sh /usr/local
 RUN pip install -e .
 
-# FA3 — Hopper kernels (warp specialization, async TMA, FP8)
-# Installs flash_attn_3 package + flash_attn_interface (top-level) + torch.ops.flash_attn_3
-# Filter ptxas output to stay under Docker's 2MB log limit per step
-RUN git clone --depth 1 https://github.com/Dao-AILab/flash-attention.git /tmp/flash-attention && \
-    cd /tmp/flash-attention/hopper && \
-    MAX_JOBS=${FLASH_ATTN_MAX_JOBS} \
-    NVCC_THREADS=${FLASH_ATTN_NVCC_THREADS} \
-    pip install . 2>&1 | awk '!/^ptxas info/' && \
-    cd / && rm -rf /tmp/flash-attention
-
-# FA4 — CuTeDSL kernels for Hopper+Blackwell (flash_attn.cute)
-RUN pip install --pre flash-attn-4
-
-# flash-attn-4 upgrades cuda-python to 12.9+ namespace stub missing cuda.bindings.driver;
-# downgrade to monolithic 12.6.2 which bundles the compiled bindings
-RUN pip install --force-reinstall --no-deps "cuda-python==12.6.2.post1"
-
-RUN pip install accelerate==1.13.0 diffusers==0.37.1 transformers==5.5.0 ftfy
-
 WORKDIR /workspace
-RUN pip install einops scipy wandb tqdm Pillow matplotlib opencv-python-headless \
-    pyyaml torchmetrics imageio-ffmpeg h5py av torch-fidelity \
-    git+https://github.com/microsoft/MoGe.git
+COPY docker/requirements.txt /tmp/requirements.txt
+RUN pip install -r /tmp/requirements.txt
+
+# Transitive dependencies (e.g. MoGe -> opencv-python) may have pulled the
+# ffmpeg-bundled opencv wheels back in; replace every cv2 with the
+# WITH_FFMPEG=OFF build produced above.
+RUN pip uninstall -y opencv-python opencv-python-headless opencv-contrib-python || true && \
+    rm -rf /usr/local/lib/python3.*/dist-packages/cv2* && \
+    pip install --no-deps /opt/ffmpeg-free-wheels/opencv_python_headless-*.whl && \
+    rm -rf /opt/ffmpeg-free-wheels
+
+# Install MoGe from a pinned, documented packaging-only patch so it requires
+# the headless distribution above. Retain its exact modified source in-image.
+COPY docker/install_moge.sh /tmp/install_moge.sh
+RUN bash /tmp/install_moge.sh && rm /tmp/install_moge.sh
+
+# NGC also ships unrelated applications pinned to older NumPy releases. Remove
+# those and their dependents, refusing to remove any project dependency.
+COPY docker/prune_ngc_extras.py /tmp/prune_ngc_extras.py
+RUN python /tmp/prune_ngc_extras.py /tmp/requirements.txt /workspace/thirdparty/3DGRUT-ArtiFixer/requirements.txt
+
+# DALI (preinstalled in NGC base images) bundles ffmpeg demux/decode libraries
+# (libavcodec, libavformat, ...), and the base's torchaudio can carry codec
+# integrations the filename scan cannot see. Nothing in this repo uses either;
+# remove both.
+# Also drop the NGC base's orphaned opencv C++ libs and dist metadata: they
+# contain no ffmpeg code, but a stale `opencv 4.10.0` in pip list plus a
+# libopencv_videoio.so on disk would mislead release audits.
+RUN (pip list --format=freeze 2>/dev/null | grep -iE '^nvidia-dali|^torchaudio' | cut -d= -f1 | xargs -r pip uninstall -y) || true && \
+    rm -rf /usr/local/lib/python3.*/dist-packages/nvidia/dali* \
+           /usr/local/lib/python3.*/dist-packages/torchaudio* \
+           /usr/local/lib/libopencv* \
+           /usr/local/lib/python3.*/dist-packages/opencv-*.dist-info
+
+# The NGC base ships a pre-populated pip cache; PIP_NO_CACHE_DIR only prevents
+# new writes, so drop the inherited one for the gate's empty-cache check.
+RUN rm -rf /root/.cache/pip
+RUN python -m pip check
 
 COPY tests/test_flash_attn.py /workspace/test_flash_attn.py
-RUN python -c "import flash_attn_interface; print('FA3 ok')"
-RUN python -c "import flash_attn_3; print('FA3 package ok')"
-RUN pip show flash-attn-4 | grep Version && echo 'FA4 ok'
+RUN if [ "${BUILD_FLASH_ATTN_3}" = "1" ]; then \
+        python -c "import flash_attn_interface, flash_attn_3; print('FA3 ok')"; \
+    else \
+        python -c "import importlib.util as u; assert u.find_spec('flash_attn_interface') is None, 'FA3 present although BUILD_FLASH_ATTN_3=0'; print('FA3 skipped as requested')"; \
+    fi
+RUN pip show flash-attn-4 | grep Version && python -c "import flash_attn.cute; print('FA4 ok')"
 RUN python -c "import cv2; print('cv2 ok:', cv2.__version__)"
 RUN python -c "from moge.model.v2 import MoGeModel; print('MoGe ok')"
+
+# Final-filesystem codec check (distribution also requires flattening): the image must contain no ffmpeg codecs.
+# NGC bases retain Git metadata and an internal build configuration. Neither is
+# needed at runtime or belongs in the flattened distribution.
+RUN find / -xdev \( -name .git -o -name .CI_CONFIG_DO_NOT_PUSH_THIS_FILE_TO_PUBLIC.yaml \) \
+    -prune -exec rm -rf -- {} +
+
+COPY tests/assert_no_ffmpeg_in_image.py /workspace/assert_no_ffmpeg_in_image.py
+RUN python /workspace/assert_no_ffmpeg_in_image.py --json
+
+LABEL com.nvidia.artifixer.flash_attn_3="${BUILD_FLASH_ATTN_3}"

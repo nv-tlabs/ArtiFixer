@@ -3,52 +3,20 @@
 
 import argparse
 import json
+import os
 import zipfile
 from pathlib import Path
 
 import numpy as np
 
 from data_processing.scene_utils import load_scene_transforms_from_dir, load_scene_transforms_from_zip
+from model_training.data.utils import pose_distance_matrix, so3_relative_angle
 
 
-def so3_relative_angle(R1: np.ndarray, R2: np.ndarray) -> np.ndarray:
-    """Compute the angle between 2 rotation matrices.
-    Args:
-        R1: the 1st rotation matrix with shape (B, 3, 3)
-        R2: the 2nd rotation matrix with shape (B, 3, 3)
-    Returns:
-        The rotation matrix angle in radians with shape (B,)
-    """
-    # (Trace(R1.T @ R2) - 1)/2
-    prod = np.matmul(np.swapaxes(R1, -2, -1), R2)
-    cos = (np.trace(prod, axis1=-2, axis2=-1) - 1) / 2
-    cos = np.clip(cos, -1.0, 1.0)
-    diff = np.abs(np.arccos(cos))
-    return diff
-
-
-def find_farthest_camera_pair(extrinsics_c2w, lambda_t: float = 1.0, normalize: bool = True):
-    """Find the farthest camera pose pair in all poses.
-    Returns:
-        farthest_pair: the tuple of the farthest camera pair indices
-        max_dist: the distance between the farthest camera pair
-    """
-    rs = extrinsics_c2w[:, :3, :3]
-    ts = extrinsics_c2w[:, :3, 3]
-    if normalize:
-        avg_scale = np.mean(np.linalg.norm(ts, axis=1))
-        ts = ts / avg_scale
-
-    t_dists = np.linalg.norm(ts[:, None, :] - ts[None, :, :], axis=-1)
-    r_dists = so3_relative_angle(rs[:, None, ...], rs[None, ...])
-    r_dists = np.rad2deg(r_dists) / 180.0
-    dists = r_dists + lambda_t * t_dists
-
-    max_dist = dists.max()
-    overall_max_index = np.argmax(dists)
-    farthest_pair = np.unravel_index(overall_max_index, dists.shape)
-
-    return farthest_pair, max_dist
+def find_farthest_camera_pair(extrinsics_c2w, lambda_t: float = 1.0):
+    """Return the indices of the two most distant camera poses and their distance."""
+    dists = pose_distance_matrix(extrinsics_c2w, lambda_t)
+    return np.unravel_index(np.argmax(dists), dists.shape), dists.max()
 
 
 def _pose_distance(ref_idx: int, extrinsics_c2w: np.ndarray, lambda_t: float = 1.0, normalize: bool = True):
@@ -104,19 +72,14 @@ def order_indices_by_farthest_sampling(init_idx, extrinsics_c2w, valid_mask):
     Returns:
         sampled_indices (np.array): (N_, ) The indices of selected camera poses
     """
-    num_poses = extrinsics_c2w.shape[0]
     num_samples = valid_mask.sum()
 
     # Initialize sampled_indices with the first point (can be random)
     sampled_indices = np.zeros(num_samples, dtype=int)
     sampled_indices[0] = init_idx
 
-    # Initialize min_distances to minus infinity for all points
-    min_distances = np.full(num_poses, -np.inf)
-
     # Calculate initial distances from the first sampled point
-    dists = _pose_distance(ref_idx=sampled_indices[0], extrinsics_c2w=extrinsics_c2w)
-    min_distances = dists
+    min_distances = _pose_distance(ref_idx=sampled_indices[0], extrinsics_c2w=extrinsics_c2w)
     min_distances[~valid_mask] = -np.inf
 
     for i in range(1, num_samples):
@@ -141,6 +104,14 @@ def load_scene_transforms(dataset_path: Path) -> dict:
     return data
 
 
+def _write_json_atomic(data: list, save_path: Path) -> None:
+    # Atomic replace so concurrent tasks sharing the scene directory never read partial JSON.
+    tmp_path = save_path.with_name(f".{save_path.name}.tmp.{os.getpid()}")
+    with open(tmp_path, "w") as json_file:
+        json.dump(data, json_file, indent=4)
+    tmp_path.replace(save_path)
+
+
 def write_half_covisibility_sampled_indices(dataset_path: Path, output_path: Path) -> None:
     data = load_scene_transforms(dataset_path)
     extrinsics_c2w = np.array([np.array(data["frames"][i]["transform_matrix"]) for i in range(len(data["frames"]))])
@@ -160,8 +131,7 @@ def write_half_covisibility_sampled_indices(dataset_path: Path, output_path: Pat
         init_idx=init_idx, extrinsics_c2w=extrinsics_c2w, valid_mask=valid_mask_first_half
     )
     save_path = output_path / "half_covisibility_sampled_indices_0.json"
-    with open(save_path, "w") as json_file:
-        json.dump(sampled_indices.tolist(), json_file, indent=4)
+    _write_json_atomic(sampled_indices.tolist(), save_path)
     print(f"Save the first half to {save_path}")
 
     init_idx = farthest_pair[1]
@@ -169,8 +139,7 @@ def write_half_covisibility_sampled_indices(dataset_path: Path, output_path: Pat
         init_idx=init_idx, extrinsics_c2w=extrinsics_c2w, valid_mask=valid_mask_second_half
     )
     save_path = output_path / "half_covisibility_sampled_indices_1.json"
-    with open(save_path, "w") as json_file:
-        json.dump(sampled_indices.tolist(), json_file, indent=4)
+    _write_json_atomic(sampled_indices.tolist(), save_path)
     print(f"Save the second half to {save_path}")
 
 

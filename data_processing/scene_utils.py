@@ -5,9 +5,16 @@ from __future__ import annotations
 
 import json
 import zipfile
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from model_training.data.scene_utils import downsampled_image_path, load_scene_transforms_from_zip, scene_zip_member
+
+
+def scene_frame_count(zip_path: Path) -> int:
+    """Number of raw frames in a DL3DV scene zip, per its transforms.json."""
+    with zipfile.ZipFile(zip_path, "r") as zip_file:
+        transforms, _ = load_scene_transforms_from_zip(zip_file, zip_path.stem)
+    return len(transforms["frames"])
 
 
 def read_scene_list(path: Path) -> list[str]:
@@ -21,6 +28,39 @@ def read_scene_list(path: Path) -> list[str]:
 
 def discover_scene_zips(dl3dv_dir: Path) -> list[Path]:
     return sorted(path for path in dl3dv_dir.rglob("*.zip") if path.is_file())
+
+
+COLMAP_SPARSE_SUBDIRS = (Path("colmap/sparse/0"), Path("sparse/0"))
+COLMAP_SPARSE_FILES = ("cameras.bin", "images.bin", "points3D.bin")
+
+
+def find_colmap_sparse_dir(scene_dir: Path) -> Path | None:
+    """Locate `colmap/sparse/0/` or `sparse/0/` by probing for `images.bin`; not a completeness check."""
+    for rel in COLMAP_SPARSE_SUBDIRS:
+        candidate = scene_dir / rel
+        if (candidate / "images.bin").exists():
+            return candidate
+    return None
+
+
+def colmap_model_files_missing_from_dir(scene_dir: Path) -> list[str]:
+    sparse_dir = find_colmap_sparse_dir(scene_dir)
+    if sparse_dir is None:
+        return list(COLMAP_SPARSE_FILES)
+    return [name for name in COLMAP_SPARSE_FILES if not (sparse_dir / name).is_file()]
+
+
+def colmap_model_files_missing_from_zip(zip_path: Path, scene_name: str) -> list[str]:
+    """Check the archive's central directory for a model at one of the positions extraction can place it."""
+    accepted = {PurePosixPath(prefix, *rel.parts) for prefix in ("", scene_name) for rel in COLMAP_SPARSE_SUBDIRS}
+    present: dict[PurePosixPath, set[str]] = {}
+    with zipfile.ZipFile(zip_path) as zf:
+        for name in zf.namelist():
+            path = PurePosixPath(name)
+            if path.parent in accepted and path.name in COLMAP_SPARSE_FILES:
+                present.setdefault(path.parent, set()).add(path.name)
+    best = max(present.values(), key=len, default=set())
+    return [name for name in COLMAP_SPARSE_FILES if name not in best]
 
 
 def resolve_scene_path(dl3dv_dir: Path, scene: str) -> Path:
@@ -104,17 +144,3 @@ def safe_extractall(zip_file: zipfile.ZipFile, output_dir: Path) -> None:
         if target != output_root and output_root not in target.parents:
             raise ValueError(f"Refusing to extract zip member outside {output_dir}: {member.filename}")
     zip_file.extractall(output_dir)
-
-
-def extract_zip(zip_path: Path, output_dir: Path, *, skip_existing_scene_dir: bool = True) -> Path:
-    output_dir.mkdir(parents=True, exist_ok=True)
-    scene_dir = output_dir / zip_path.stem
-    if skip_existing_scene_dir and scene_dir.exists():
-        return scene_dir
-
-    with zipfile.ZipFile(zip_path, "r") as zf:
-        safe_extractall(zf, output_dir)
-
-    if scene_dir.exists():
-        return scene_dir
-    return output_dir

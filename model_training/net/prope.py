@@ -28,16 +28,16 @@
 #
 #    attn_src = PropeDotProductAttention(...)
 #    attn_tgt = PropeDotProductAttention(...)
-#    attn_src._precompute_and_cache_apply_fns(viewmats_src, Ks_src)
-#    attn_tgt._precompute_and_cache_apply_fns(viewmats_tgt, Ks_tgt)
-#    q_src = attn_src._apply_to_q(q_src)
-#    k_tgt = attn_tgt._apply_to_kv(k_tgt)
-#    v_tgt = attn_tgt._apply_to_kv(v_tgt)
+#    src_fns = attn_src.precompute_apply_fns(viewmats_src, Ks_src)
+#    tgt_fns = attn_tgt.precompute_apply_fns(viewmats_tgt, Ks_tgt)
+#    q_src = src_fns.apply_to_q(q_src)
+#    k_tgt = tgt_fns.apply_to_kv(k_tgt)
+#    v_tgt = tgt_fns.apply_to_kv(v_tgt)
 #    o_src = F.scaled_dot_product_attention(q_src, k_tgt, v_tgt, **kwargs)
-#    o_src = attn_src._apply_to_o(o_src)
+#    o_src = src_fns.apply_to_o(o_src)
 
 from functools import partial
-from typing import Callable, List, Tuple
+from typing import Callable, List, NamedTuple, Tuple
 
 import torch
 from torch import nn
@@ -89,43 +89,36 @@ class PropeDotProductAttention(torch.nn.Module):
         self.coeffs_y_0 = nn.Buffer(coeffs_y[0], persistent=False)
         self.coeffs_y_1 = nn.Buffer(coeffs_y[1], persistent=False)
 
-    def _precompute_and_cache_apply_fns(self, viewmats: torch.Tensor, Ks_norm: torch.Tensor):
+    def precompute_apply_fns(self, viewmats: torch.Tensor, Ks_norm: torch.Tensor) -> "PropeApplyFns":
+        """Build the PRoPE transforms for one set of cameras.
+
+        The transforms are returned rather than stored on this (shared) module.
+        Gradient checkpointing re-runs each transformer block at backward time
+        with the same non-tensor args it was given, so transforms stored on the
+        module could be overwritten by a later forward (e.g. the next chunk of
+        an autoregressive rollout) before backward runs.
+        """
         batch, cameras, _, _ = viewmats.shape
         assert viewmats.shape == (batch, cameras, 4, 4)
         assert Ks_norm.shape == (batch, cameras, 3, 3)
-        self.cameras = cameras
 
-        self.apply_fn_q, self.apply_fn_kv, self.apply_fn_o = _prepare_apply_fns(
-            head_dim=self.head_dim,
-            viewmats=viewmats,
-            Ks_norm=Ks_norm,
-            coeffs_x=(self.coeffs_x_0, self.coeffs_x_1),
-            coeffs_y=(self.coeffs_y_0, self.coeffs_y_1),
+        return PropeApplyFns(
+            *_prepare_apply_fns(
+                head_dim=self.head_dim,
+                viewmats=viewmats,
+                Ks_norm=Ks_norm,
+                coeffs_x=(self.coeffs_x_0, self.coeffs_x_1),
+                coeffs_y=(self.coeffs_y_0, self.coeffs_y_1),
+            )
         )
 
-    def _apply_to_q(self, q: torch.Tensor) -> torch.Tensor:
-        batch, num_heads, seqlen, head_dim = q.shape
-        assert seqlen == self.cameras * self.patches_x * self.patches_y
-        assert head_dim == self.head_dim
-        assert q.shape == (batch, num_heads, seqlen, head_dim)
-        assert self.apply_fn_q is not None
-        return self.apply_fn_q(q)
 
-    def _apply_to_kv(self, kv: torch.Tensor) -> torch.Tensor:
-        batch, num_heads, seqlen, head_dim = kv.shape
-        assert seqlen == self.cameras * self.patches_x * self.patches_y
-        assert head_dim == self.head_dim
-        assert kv.shape == (batch, num_heads, seqlen, head_dim)
-        assert self.apply_fn_kv is not None
-        return self.apply_fn_kv(kv)
+class PropeApplyFns(NamedTuple):
+    """The PRoPE Q/KV/O transforms for one set of cameras."""
 
-    def _apply_to_o(self, o: torch.Tensor) -> torch.Tensor:
-        batch, num_heads, seqlen, head_dim = o.shape
-        assert seqlen == self.cameras * self.patches_x * self.patches_y
-        assert head_dim == self.head_dim
-        assert o.shape == (batch, num_heads, seqlen, head_dim)
-        assert self.apply_fn_o is not None
-        return self.apply_fn_o(o)
+    apply_to_q: Callable[[torch.Tensor], torch.Tensor]
+    apply_to_kv: Callable[[torch.Tensor], torch.Tensor]
+    apply_to_o: Callable[[torch.Tensor], torch.Tensor]
 
 
 def _prepare_apply_fns(
@@ -270,7 +263,6 @@ def _apply_block_diagonal(
         end = start + block_size
         out[..., start:end] = func(x_block)
         start = end
-    assert out.shape == feats.shape, "Input/output shapes should match."
     return out
 
 

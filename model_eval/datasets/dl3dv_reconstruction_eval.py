@@ -6,15 +6,45 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Collection
 from pathlib import Path
 from zipfile import ZipFile
 
-import torch
-
 from model_eval.datasets.reconstructed_colmap_eval import ReconstructedColmapEvalDataset, ReconstructedColmapScene
 from model_eval.dl3dv_difix_frame_remap import apply_difix_frame_remap
+from model_eval.dl3dv_reconstruction_evalsets import RECON_SUBDIR_BY_EVALSET
+from model_eval.prepare_dl3dv_distill_dataset import scene_items_from_split
 from model_training.data.scene_utils import downsampled_image_path, load_scene_transforms_from_zip
 from model_training.data.utils import NeighborSelectionMode
+from model_training.model_profiles import prompt_format_for_model, spatial_resize_multiple
+from model_training.prompt_formats import caption_filename_for_format
+
+
+def create_dl3dv_reconstruction_dataset(args, selection_mode, max_test_frames, include_all_frames, rank: int):
+    recon_subdir = args.dl3dv_recon_subdir or RECON_SUBDIR_BY_EVALSET[args.evalset]
+    filter_scene_ids = args.scene_ids
+    if filter_scene_ids is None and args.scene_id is not None:
+        filter_scene_ids = [args.scene_id]
+    return DL3DVReconstructionEvalDataset(
+        split="test",
+        split_path=args.split_path,
+        dl3dv_dir=args.dl3dv_dir,
+        recon_results_dir=args.recon_results_dir,
+        prompt_dir=args.prompt_dir,
+        num_views=args.num_views,
+        dataset_scaling_factor=args.dataset_scaling_factor,
+        checkpoint=args.dl3dv_reconstruction_checkpoint,
+        neighbor_selection_mode=selection_mode,
+        max_test_frames=max_test_frames,
+        include_all_frames=include_all_frames,
+        filter_scene_ids=filter_scene_ids,
+        resize_multiple=spatial_resize_multiple(args.model_id),
+        prompt_format=prompt_format_for_model(args.model_id),
+        camera_pose_alignment=args.camera_pose_alignment,
+        verbose=(rank == 0),
+        recon_subdir=recon_subdir,
+        use_difix_frame_remap=args.evalset.endswith("_difix"),
+    )
 
 
 class DL3DVReconstructionEvalDataset(ReconstructedColmapEvalDataset):
@@ -34,8 +64,11 @@ class DL3DVReconstructionEvalDataset(ReconstructedColmapEvalDataset):
         neighbor_selection_mode: NeighborSelectionMode = NeighborSelectionMode.COVISIBILITY,
         max_test_frames: int | None = None,
         include_all_frames: bool = False,
-        filter_scene_id: str | None = None,
-        generator: torch.Generator | None = None,
+        filter_scene_ids: Collection[str] | None = None,
+        resize_multiple: int = 16,
+        *,
+        prompt_format: str,
+        camera_pose_alignment: str = "mean",
         verbose: bool = False,
         recon_subdir: str | None = None,
         use_difix_frame_remap: bool = False,
@@ -48,6 +81,7 @@ class DL3DVReconstructionEvalDataset(ReconstructedColmapEvalDataset):
         self.checkpoint = checkpoint
         self.recon_subdir = recon_subdir
         self.use_difix_frame_remap = use_difix_frame_remap
+        self.filter_scene_ids = set(filter_scene_ids) if filter_scene_ids is not None else None
         super().__init__(
             split=split,
             split_path=split_path,
@@ -55,8 +89,9 @@ class DL3DVReconstructionEvalDataset(ReconstructedColmapEvalDataset):
             neighbor_selection_mode=neighbor_selection_mode,
             max_test_frames=max_test_frames,
             include_all_frames=include_all_frames,
-            filter_scene_id=filter_scene_id,
-            generator=generator,
+            resize_multiple=resize_multiple,
+            prompt_format=prompt_format,
+            camera_pose_alignment=camera_pose_alignment,
             verbose=verbose,
         )
 
@@ -83,37 +118,33 @@ class DL3DVReconstructionEvalDataset(ReconstructedColmapEvalDataset):
         assert render_indices == list(range(len(render_indices))), f"{render_dir} frame indices must be contiguous"
         return len(render_indices)
 
-    @staticmethod
-    def _scene_items_from_split(split_data: object) -> list[tuple[str, str]]:
-        if isinstance(split_data, dict):
-            return [(scene_id, recons[0]["subdir"]) for scene_id, recons in split_data.items() if recons]
-
-        scene_items = []
-        seen = set()
-        assert isinstance(split_data, list), "DL3DV split must be a mapping or list of scene metadata"
-        for item in split_data:
-            assert isinstance(item, dict), f"DL3DV split item must be a mapping, got {item!r}"
-            for metadata in item.values():
-                scene_id = metadata["scene_id"]
-                if scene_id not in seen:
-                    scene_items.append((scene_id, metadata["subdir"]))
-                    seen.add(scene_id)
-        return scene_items
-
     def _load_scene_data(
         self,
         split_path: Path,
         split: str,
-        filter_scene_id: str | None,
+        filter_scene_id: str | None,  # always None here; this dataset filters via filter_scene_ids
         verbose: bool,
     ) -> None:
         with open(split_path) as f:
             split_data = json.load(f)[split]
 
         self._reset_scene_data()
+        scene_items = tuple(
+            scene_items_from_split(
+                split_data,
+                include_metric_scale=True,
+            )
+        )
+        if self.filter_scene_ids is not None:
+            split_scene_ids = {scene_id for scene_id, _, _ in scene_items}
+            unknown_scene_ids = sorted(self.filter_scene_ids - split_scene_ids)
+            if unknown_scene_ids:
+                raise ValueError(
+                    f"Requested DL3DV scene IDs are absent from the {split!r} split: " f"{', '.join(unknown_scene_ids)}"
+                )
 
-        for scene_id, source_subdir in self._scene_items_from_split(split_data):
-            if filter_scene_id is not None and scene_id != filter_scene_id:
+        for scene_id, source_subdir, metric_scale in scene_items:
+            if self.filter_scene_ids is not None and scene_id not in self.filter_scene_ids:
                 continue
 
             checkpoint_dir = self._get_checkpoint_dir(scene_id)
@@ -121,16 +152,37 @@ class DL3DVReconstructionEvalDataset(ReconstructedColmapEvalDataset):
             opacity_dir = checkpoint_dir / "opacity"
             selected_indices_path = checkpoint_dir / "selected_indices.json"
             transforms_path = self.dl3dv_dir / source_subdir / f"{scene_id}.zip"
-            prompt_paths = sorted((self.prompt_dir / source_subdir / scene_id).glob("*.h5"))
 
             required_paths = (render_dir, opacity_dir, selected_indices_path, transforms_path)
             missing = [path for path in required_paths if not path.exists()]
-            if not prompt_paths:
-                missing.append(self.prompt_dir / source_subdir / scene_id)
             if missing:
+                if self.filter_scene_ids is not None:
+                    raise FileNotFoundError(
+                        f"Requested DL3DV scene {scene_id!r} cannot be evaluated: missing {missing[0]}"
+                    )
                 if verbose:
                     print(f"Skipping {scene_id}: missing {missing[0]}")
                 continue
+
+            # Evaluation always conditions on the scene's canonical
+            # forward-order caption, never on the reverse/revisit training
+            # variants stored next to it. A missing canonical prompt is a data
+            # error, not a scene-not-reconstructed-here condition, so it
+            # raises even when scenes without renders are skipped above.
+            # Unlike the HDF5 eval, only scenes this run evaluates are
+            # checked: parallel evaluation uses --scene_ids, and one shard
+            # must not fail on another shard's scene.
+            canonical_prompt_path = (
+                self.prompt_dir
+                / source_subdir
+                / scene_id
+                / caption_filename_for_format("frames_all_stride_1.h5", self.prompt_format)
+            )
+            if not canonical_prompt_path.exists():
+                raise FileNotFoundError(
+                    f"Scene {scene_id} has no canonical evaluation prompt {canonical_prompt_path} "
+                    "(regenerate the scene's prompt files)"
+                )
 
             with ZipFile(transforms_path, "r") as zip_file:
                 transforms, _ = load_scene_transforms_from_zip(zip_file, scene_id)
@@ -154,8 +206,8 @@ class DL3DVReconstructionEvalDataset(ReconstructedColmapEvalDataset):
                 opacity_dir=opacity_dir,
                 selected_indices_path=selected_indices_path,
                 target_indices_path=None,
-                prompt_paths=prompt_paths,
-                camera_scale=self.dataset_scaling_factor,
+                prompt_path=canonical_prompt_path,
+                camera_scale=metric_scale * self.dataset_scaling_factor,
                 has_gt=True,
             )
             self._register_scene(scene, transforms, verbose)

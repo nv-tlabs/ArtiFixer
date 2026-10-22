@@ -28,3 +28,7 @@ __pycache__/
 
 thirdparty/Difix3D/
 thirdparty/GEN3C/
+
+# Never copy nested repository metadata or local release receipts into images.
+**/.git
+/release-artifacts/

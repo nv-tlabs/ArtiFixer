@@ -18,7 +18,7 @@ The prepared split file stores the exact paths for each scene:
 
 import json
 import warnings
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 from zipfile import ZipFile
@@ -27,19 +27,31 @@ import numpy as np
 import torch
 from PIL import Image
 
+from data_processing.reconstructed_colmap_split import (
+    read_split_scenes,
+    resolve_has_gt,
+    resolve_optional_path,
+    resolve_required_number,
+    resolve_required_path,
+)
+from model_eval.reconstructed_colmap_evalsets import DEFAULT_RECONSTRUCTED_COLMAP_NUM_VIEWS
 from model_training.data.scene_utils import scene_zip_member
 from model_training.data.utils import (
     InferencePair,
     NeighborSelectionMode,
     compute_camera_rays,
     generate_inference_pairs,
-    load_encoded_prompt,
     load_indexed_frames,
-    resize_to_multiple_of_16,
+    load_prompt_payload_from_path,
+    resize_to_multiple,
     visualize_inference_pairs,
 )
-
-DEFAULT_RECONSTRUCTED_COLMAP_NUM_VIEWS = 12
+from model_training.model_profiles import (
+    prompt_format_for_model,
+    requires_reference_camera_rays,
+    spatial_resize_multiple,
+)
+from model_training.prompt_formats import caption_filename_for_format
 
 
 @dataclass(frozen=True)
@@ -51,29 +63,9 @@ class ReconstructedColmapScene:
     opacity_dir: Path
     selected_indices_path: Path
     target_indices_path: Path | None
-    prompt_paths: list[Path]
+    prompt_path: Path
     camera_scale: float
     has_gt: bool
-
-
-def resolve_prepared_path(split_root: Path, value: str, field_name: str) -> Path:
-    assert isinstance(value, str), f"reconstructed-COLMAP split field {field_name!r} must be a path string"
-    path = Path(value)
-    return path if path.is_absolute() else split_root / path
-
-
-def resolve_required_prepared_path(split_root: Path, metadata: dict[str, Any], field_name: str) -> Path:
-    assert field_name in metadata, f"Missing required reconstructed-COLMAP split field: {field_name}"
-    return resolve_prepared_path(split_root, metadata[field_name], field_name)
-
-
-def resolve_required_number(metadata: dict[str, Any], field_name: str) -> float:
-    assert field_name in metadata, f"Missing required reconstructed-COLMAP split field: {field_name}"
-    value = metadata[field_name]
-    assert isinstance(value, int | float) and not isinstance(
-        value, bool
-    ), f"reconstructed-COLMAP split field {field_name!r} must be numeric, got {value!r}"
-    return float(value)
 
 
 def load_frames_from_prepared_paths(image_root: Path, file_paths: list[str]) -> torch.Tensor:
@@ -101,6 +93,23 @@ def load_frames_from_prepared_paths(image_root: Path, file_paths: list[str]) -> 
         return torch.FloatTensor(np.stack(frames)).permute(0, 3, 1, 2) / 255.0
 
 
+def create_reconstructed_colmap_dataset(args, selection_mode, max_test_frames, include_all_frames, rank: int):
+    return ReconstructedColmapEvalDataset(
+        split="test",
+        split_path=args.split_path,
+        num_views=args.num_views,
+        neighbor_selection_mode=selection_mode,
+        max_test_frames=max_test_frames,
+        include_all_frames=include_all_frames,
+        use_target_indices=args.render_trajectory == "trajectory",
+        filter_scene_id=args.scene_id,
+        resize_multiple=spatial_resize_multiple(args.model_id),
+        prompt_format=prompt_format_for_model(args.model_id),
+        camera_pose_alignment=args.camera_pose_alignment,
+        verbose=(rank == 0),
+    )
+
+
 class ReconstructedColmapEvalDataset(torch.utils.data.Dataset):
     """
     Dataset for evaluating ArtiFixer on COLMAP-scene reconstruction renders.
@@ -121,14 +130,19 @@ class ReconstructedColmapEvalDataset(torch.utils.data.Dataset):
         include_all_frames: bool = False,
         use_target_indices: bool = False,
         filter_scene_id: str | None = None,
-        generator: torch.Generator | None = None,
+        resize_multiple: int = 16,
+        *,
+        prompt_format: str,
+        camera_pose_alignment: str = "mean",
         verbose: bool = False,
     ):
-        self.generator = generator
         self.num_views = num_views
         self.neighbor_selection_mode = neighbor_selection_mode
         self.include_all_frames = include_all_frames
         self.use_target_indices = use_target_indices
+        self.resize_multiple = resize_multiple
+        self.prompt_format = prompt_format
+        self.camera_pose_alignment = camera_pose_alignment
 
         self._load_scene_data(split_path, split, filter_scene_id, verbose)
         self._generate_inference_items(num_views, max_test_frames, verbose)
@@ -143,20 +157,24 @@ class ReconstructedColmapEvalDataset(torch.utils.data.Dataset):
         """Load scene metadata, transforms, and train/test splits."""
         split_path = split_path.resolve()
         split_root = split_path.parent
-        with open(split_path) as f:
-            split_data = json.load(f)[split]
+        split_data = read_split_scenes(split_path, split)
 
         self._reset_scene_data()
-
-        assert isinstance(
-            split_data, dict
-        ), "reconstructed_colmap split must be a mapping from scene id to prepared-scene metadata"
 
         for scene_id, metadata in split_data.items():
             if filter_scene_id is not None and scene_id != filter_scene_id:
                 continue
 
             scene = self._load_scene_metadata(split_root, scene_id, metadata)
+            # Legacy splits record the base caption filename; preparation can
+            # also record the actual format-specific path. The resolver adds
+            # the requested format suffix only when it is not already present.
+            scene = replace(
+                scene,
+                prompt_path=scene.prompt_path.with_name(
+                    caption_filename_for_format(scene.prompt_path.name, self.prompt_format)
+                ),
+            )
             assert not (
                 self.include_all_frames and scene.target_indices_path is not None and not self.use_target_indices
             ), f"Scene {scene_id!r} is a trajectory split; use --render_trajectory=trajectory, not all_frames"
@@ -166,10 +184,11 @@ class ReconstructedColmapEvalDataset(torch.utils.data.Dataset):
                 scene.render_dir,
                 scene.opacity_dir,
                 scene.selected_indices_path,
+                scene.prompt_path,
             )
             if scene.target_indices_path is not None:
                 required_paths = (*required_paths, scene.target_indices_path)
-            for path in (*required_paths, *scene.prompt_paths):
+            for path in required_paths:
                 if not path.exists():
                     raise FileNotFoundError(f"Prepared scene {scene_id!r} references missing path: {path}")
 
@@ -186,24 +205,17 @@ class ReconstructedColmapEvalDataset(torch.utils.data.Dataset):
             f"Scene {scene_id!r} is missing prepared metadata. "
             "Re-run data_processing.prepare_colmap_artifixer_inputs with the current code."
         )
-        prompt_path = resolve_required_prepared_path(split_root, metadata, "prompt_path")
-        has_gt = metadata.get("has_gt", True)
-        assert isinstance(has_gt, bool), f"Scene {scene_id!r} has non-boolean has_gt metadata: {has_gt!r}"
         return ReconstructedColmapScene(
             scene_id=scene_id,
-            transforms_path=resolve_required_prepared_path(split_root, metadata, "transforms_path"),
-            image_root=resolve_required_prepared_path(split_root, metadata, "image_root"),
-            render_dir=resolve_required_prepared_path(split_root, metadata, "render_dir"),
-            opacity_dir=resolve_required_prepared_path(split_root, metadata, "opacity_dir"),
-            selected_indices_path=resolve_required_prepared_path(split_root, metadata, "selected_indices_path"),
-            target_indices_path=(
-                resolve_prepared_path(split_root, metadata["target_indices_path"], "target_indices_path")
-                if "target_indices_path" in metadata
-                else None
-            ),
-            prompt_paths=[prompt_path],
+            transforms_path=resolve_required_path(split_root, metadata, "transforms_path"),
+            image_root=resolve_required_path(split_root, metadata, "image_root"),
+            render_dir=resolve_required_path(split_root, metadata, "render_dir"),
+            opacity_dir=resolve_required_path(split_root, metadata, "opacity_dir"),
+            selected_indices_path=resolve_required_path(split_root, metadata, "selected_indices_path"),
+            target_indices_path=resolve_optional_path(split_root, metadata, "target_indices_path"),
+            prompt_path=resolve_required_path(split_root, metadata, "prompt_path"),
             camera_scale=resolve_required_number(metadata, "camera_scale"),
-            has_gt=has_gt,
+            has_gt=resolve_has_gt(scene_id, metadata),
         )
 
     def _reset_scene_data(self) -> None:
@@ -335,24 +347,23 @@ class ReconstructedColmapEvalDataset(torch.utils.data.Dataset):
 
         item = {}
 
-        # Load encoded prompt
-        encoded_prompt, caption = load_encoded_prompt(
-            scene.prompt_paths,
-            self.generator,
+        prompt_payload, caption = load_prompt_payload_from_path(
+            scene.prompt_path,
+            prompt_format=self.prompt_format,
         )
-        item["encoded_prompt"] = encoded_prompt
+        item.update(prompt_payload)
         item["prompt"] = caption
 
         # Load rendered images
         rgb_rendered = load_indexed_frames(scene.render_dir, frame_indices, filename_format="{:05d}.png")
-        item["rgb_rendered"] = resize_to_multiple_of_16(rgb_rendered)
+        item["rgb_rendered"] = resize_to_multiple(rgb_rendered, self.resize_multiple)
         output_size_source = rgb_rendered
 
         # Load ground truth images
         if scene.has_gt:
             gt_file_paths = [transforms["frames"][x]["file_path"] for x in frame_indices]
             rgb_gt = load_frames_from_prepared_paths(scene.image_root, gt_file_paths)
-            item["rgb_gt"] = resize_to_multiple_of_16(rgb_gt)
+            item["rgb_gt"] = resize_to_multiple(rgb_gt, self.resize_multiple)
             output_size_source = rgb_gt
 
         item["target_h"] = output_size_source.shape[-2]
@@ -361,11 +372,11 @@ class ReconstructedColmapEvalDataset(torch.utils.data.Dataset):
         # Load neighbor frames
         neighbor_file_paths = [transforms["frames"][x]["file_path"] for x in neighbor_indices]
         rgb_neighbors = load_frames_from_prepared_paths(scene.image_root, neighbor_file_paths)
-        item["rgb_neighbors"] = resize_to_multiple_of_16(rgb_neighbors)
+        item["rgb_neighbors"] = resize_to_multiple(rgb_neighbors, self.resize_multiple)
 
         # Load opacity
         opacity = load_indexed_frames(scene.opacity_dir, frame_indices, filename_format="{:05d}.png", grayscale=True)
-        item["opacity"] = resize_to_multiple_of_16(opacity).squeeze(1)
+        item["opacity"] = resize_to_multiple(opacity, self.resize_multiple).squeeze(1)
 
         # Camera rays condition the target frames, so match the rendered target tensor.
         H, W = item["rgb_rendered"].shape[-2], item["rgb_rendered"].shape[-1]
@@ -376,6 +387,8 @@ class ReconstructedColmapEvalDataset(torch.utils.data.Dataset):
             scale=scene.camera_scale,
             image_shape=(H, W),
             skip_vae_check=True,  # Eval script handles padding
+            pose_alignment=self.camera_pose_alignment,
+            include_neighbor_rays=requires_reference_camera_rays(self.prompt_format),
         )
         item.update(camera_items)
 
