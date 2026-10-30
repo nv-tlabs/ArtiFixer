@@ -325,7 +325,8 @@ class ArtifixerTransformer(nn.Module):
         # post-PRoPE K/V are used directly, so the reference views do not
         # need re-embedding and their PRoPE transforms are not rebuilt.
         # neighbor_hidden_states then only signals that the neighbor
-        # cross-attention branch is active.
+        # cross-attention branch is active. A recompute_neighbor_kv rollout
+        # never fills the slots, so every pass rebuilds the reference K/V.
         neighbor_caches_warm = context_kv_cache is not None and all(
             context_kv_cache.has_neighbor_kv(layer_index) for layer_index in range(len(self.blocks))
         )
@@ -829,7 +830,7 @@ class ArtifixerCrossAttnProcessor:
                     prope_reference.apply_to_kv(value_neighbor.transpose(2, 1).float()).transpose(2, 1).to(query_dtype)
                 )
 
-                if context_kv_cache is not None:
+                if context_kv_cache is not None and not context_kv_cache.recompute_neighbor_kv:
                     context_kv_cache.store_neighbor_kv(layer_index, key_neighbor, value_neighbor)
 
             query_neighbor = prope_target.apply_to_q(query.transpose(2, 1).float()).transpose(2, 1).to(query_dtype)

@@ -49,6 +49,7 @@ class ArtifixerKvCachePipeline(ArtifixerPipelineBase):
         attention_backend: str | None = None,
         flow_shift: float = WAN_FLOW_SHIFT,
         truncate_rollout_gradients: bool = False,
+        recompute_neighbor_kv: bool = False,
     ):
         validate_positive_frame_count("ar_frames_per_chunk", ar_frames_per_chunk)
         validate_rollout_window_options(local_attn_size, sink_size)
@@ -78,9 +79,10 @@ class ArtifixerKvCachePipeline(ArtifixerPipelineBase):
         # assert_training_rollout_fits_window).
         self.ar_window_chunks = None if local_attn_size == -1 else local_attn_size // ar_frames_per_chunk
         self.ar_sink_chunks = sink_size // ar_frames_per_chunk
-        # Threaded into every rollout's RolloutKvCache; the flag is defined
+        # Threaded into every rollout's RolloutKvCache; the flags are defined
         # there.
         self.truncate_rollout_gradients = truncate_rollout_gradients
+        self.recompute_neighbor_kv = recompute_neighbor_kv
 
         transformer.requires_grad_(True)
         prepare_transformer_for_training(transformer, attention_backend)
@@ -281,6 +283,7 @@ class ArtifixerKvCachePipeline(ArtifixerPipelineBase):
         kv_cache = RolloutKvCache(
             len(self.transformer.blocks),
             truncate_rollout_gradients=self.truncate_rollout_gradients,
+            recompute_neighbor_kv=self.recompute_neighbor_kv,
         )
         current_start_frame = 0
         all_num_frames = [self.ar_frames_per_chunk] * (latent_num_frames // self.ar_frames_per_chunk)

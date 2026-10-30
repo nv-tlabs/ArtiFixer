@@ -434,6 +434,46 @@ def test_wan_kv_cache_construction_forwards_the_windowing_knobs(monkeypatch, tmp
     assert "frames_per_block" not in kwargs
 
 
+def test_recompute_neighbor_kv_reaches_the_wan_kv_cache_pipe(monkeypatch, tmp_path):
+    """--recompute_neighbor_kv is off by default and reaches the Wan KV-cache
+    pipe when set (the rollout numerics are pinned in test_wan_rollout_cache.py)."""
+    _, wan_constructed = _patch_pipeline_factories(monkeypatch)
+    checkpoint_argv = _stamped_checkpoint(tmp_path, "mean")
+    common = ["--model_id", WAN22_TI2V_5B_MODEL_ID, "--inference_pipeline", "kv_cache"]
+
+    for extra_argv in ([], ["--recompute_neighbor_kv"]):
+        run_inference.get_eval_pipe(_parse_args(common + extra_argv, checkpoint_argv), torch.device("cpu"))
+
+    assert [kwargs["recompute_neighbor_kv"] for kwargs in wan_constructed] == [False, True]
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["--inference_pipeline", "bidirectional"],
+        ["--model_id", COSMOS3_NANO_MODEL_ID, "--inference_pipeline", "kv_cache"],
+    ],
+)
+def test_parser_rejects_recompute_neighbor_kv_without_wan_neighbor_kv(capsys, tmp_path, argv):
+    """The bidirectional pipeline and Cosmos3 keep no neighbor K/V cache, so
+    the flag would be silently inert there."""
+    with pytest.raises(SystemExit):
+        _parse_args(argv + ["--recompute_neighbor_kv"], checkpoint_argv=_stamped_checkpoint(tmp_path))
+
+    assert "--recompute_neighbor_kv is only supported" in capsys.readouterr().err
+
+
+def test_get_kv_cache_pipe_rejects_recompute_neighbor_kv_for_cosmos3(monkeypatch):
+    from model_training.utils import train_utils
+
+    cosmos3_constructed, _ = _patch_pipeline_factories(monkeypatch)
+    args = SimpleNamespace(model_id=COSMOS3_NANO_MODEL_ID)
+
+    with pytest.raises(ValueError, match="Wan KV-cache rollouts only"):
+        train_utils.get_kv_cache_pipe(args, "cpu", recompute_neighbor_kv=True)
+    assert cosmos3_constructed == []
+
+
 def test_latent_frame_multiple_reads_each_familys_chunk_size():
     """The chunk-boundary padding multiple is pinned against the REAL
     Cosmos3 rollout pipeline, so renaming ar_frames_per_chunk breaks here

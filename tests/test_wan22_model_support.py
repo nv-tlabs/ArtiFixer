@@ -350,6 +350,7 @@ def test_kv_cache_pipeline_expands_only_transformer_timestep():
     pipe.ar_window_chunks = None
     pipe.ar_sink_chunks = 0
     pipe.truncate_rollout_gradients = False
+    pipe.recompute_neighbor_kv = False
     pipe.prepare_latents = lambda condition, opacity, first_frame, **kwargs: torch.zeros_like(condition)
     condition = torch.zeros(1, 2, 2, 2, 2)
     rendered_opacity = torch.zeros(1, 5, 2, 2)

@@ -317,7 +317,7 @@ def get_eval_pipe(args: argparse.Namespace, device: torch.device):
             )
         else:
             # The causal rollout of a distilled checkpoint; the dispatcher picks the family pipeline.
-            pipe = get_kv_cache_pipe(args, device)
+            pipe = get_kv_cache_pipe(args, device, recompute_neighbor_kv=args.recompute_neighbor_kv)
     if args.vae_tiling:
         # Only sets the VAE's tiling flags; the tiles are cut at encode/decode time.
         pipe.vae.enable_tiling()
