@@ -101,6 +101,20 @@ from `--backend`, which selects the masked implementation. Use `_native_flash`
 for a BF16 unmasked flash comparison; omitting the option selects the runtime
 default, which may reject FP32-master fixture inputs before masked attention.
 
+To check `--recompute_neighbor_kv` on one GPU with a Wan checkpoint, run the
+probe below. It needs no dataset and writes to a new output file:
+
+```bash
+python -m tests.neighbor_kv_recompute_probe --checkpoint /path/to/model.pt \
+    --model_id Wan-AI/Wan2.1-T2V-14B-Diffusers --output /path/to/new-report.json
+```
+
+It loads the eval pipeline once. It then runs the KV-cache denoise and decode
+twice on a synthetic clip with the same seed, first caching the reference K/V
+and then recomputing them. The report gives peak allocated memory and wall
+clock for each run. The probe exits nonzero unless both the latents and the
+decoded frames are bit-identical.
+
 Run the shared-gather and Cosmos3 CP1/CP2 parity cases with at least two CUDA
 devices. These tests spawn their own NCCL groups: run plain pytest, not
 `torchrun`, which would make them skip their nested process groups. They cover
