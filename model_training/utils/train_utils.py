@@ -585,13 +585,19 @@ def get_kv_cache_pipe(
     device: torch.device | str,
     *,
     truncate_rollout_gradients: bool = False,
+    recompute_neighbor_kv: bool = False,
 ) -> ArtifixerKvCachePipeline | ArtifixerCosmos3KvCachePipeline:
     """Build the family's KV-cache rollout pipeline for args.model_id.
 
     args must carry frames_per_block, local_attn_size, and sink_size; the
     scheduler shift comes from the model profile. truncate_rollout_gradients
     is a training option (inert under no_grad), so only distillation passes it.
+    recompute_neighbor_kv is a Wan inference memory option (see
+    RolloutKvCache); Cosmos3 keeps reference tokens in self-attention and
+    caches no neighbor K/V, so it rejects the option.
     """
+    if recompute_neighbor_kv and is_cosmos3_model(args.model_id):
+        raise ValueError("recompute_neighbor_kv applies to Wan KV-cache rollouts only; Cosmos3 caches no neighbor K/V")
     attention_backend = configure_attention(device, attention_backend=args.attention_backend)
     resolved_flow_shift = flow_shift_for_model(args.model_id)
     model_revision = getattr(args, "model_revision", None)
@@ -633,6 +639,7 @@ def get_kv_cache_pipe(
         attention_backend=attention_backend,
         flow_shift=resolved_flow_shift,
         truncate_rollout_gradients=truncate_rollout_gradients,
+        recompute_neighbor_kv=recompute_neighbor_kv,
     )
     validate_model_profile(args.model_id, pipe)
     return pipe

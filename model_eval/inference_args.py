@@ -20,6 +20,7 @@ from model_eval.reconstructed_colmap_evalsets import (
 )
 from model_training.arguments import get_eval_common_opts
 from model_training.checkpoint_metadata import resolve_camera_pose_alignment
+from model_training.model_profiles import is_cosmos3_model
 
 EVALSETS = (
     "3dgrut_dl3dv_ours",
@@ -171,6 +172,15 @@ def add_inference_args(parser: argparse.ArgumentParser) -> None:
         ),
     )
     parser.add_argument(
+        "--recompute_neighbor_kv",
+        action="store_true",
+        help=(
+            "Wan --inference_pipeline=kv_cache only: recompute the reference-view cross-attention K/V on every "
+            "transformer call instead of caching them for the whole clip. Same outputs; saves the per-reference-view "
+            "cache memory (see docs/setup.md) at the cost of two extra projections per block per call."
+        ),
+    )
+    parser.add_argument(
         "--output_suffix",
         default="",
         type=str,
@@ -270,6 +280,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             parser.error("--text_guidance_scale must be finite and at least 1 (1 disables CFG)")
     if args.max_neighbors_per_encode is not None and args.max_neighbors_per_encode <= 0:
         parser.error("--max_neighbors_per_encode must be positive when set")
+    if args.recompute_neighbor_kv and (args.inference_pipeline != "kv_cache" or is_cosmos3_model(args.model_id)):
+        parser.error("--recompute_neighbor_kv is only supported with --inference_pipeline kv_cache on Wan models")
     args.camera_pose_alignment = resolve_camera_pose_alignment(
         args.checkpoint, args.model_id, camera_pose_alignment=args.camera_pose_alignment
     )

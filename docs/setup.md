@@ -56,6 +56,9 @@ At 960 × 544, 14B weights plus caches total about 79 GB with six references and
 89 GB with the default 12 for `reconstructed_colmap`. Allow additional memory
 for activations and VAE buffers. The 1.3B model uses about 3.4 GB
 for BF16 transformer weights and roughly 4.5 times less cache memory.
+For Wan KV-cache inference, `--recompute_neighbor_kv` drops the per-reference-view
+cache: each transformer call recomputes the reference K/V instead. Outputs are
+unchanged; the extra compute grows with reference count and denoising calls.
 
 The Cosmos3-Nano model has 15.8B transformer parameters: approximately
 31.6 GB of BF16 weights and a 63.2 GB FP32 checkpoint file. Those figures exclude

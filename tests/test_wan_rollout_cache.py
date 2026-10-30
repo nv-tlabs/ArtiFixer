@@ -4,7 +4,8 @@
 """Wan rollout tests on the shared RolloutKvCache, on a real reduced-config
 WanTransformer3DModel: the cross-chunk gradient path (mode-parameterized),
 gradient-checkpointing recompute equality, per-chunk final-call storage,
-windowed eviction, and the write-once text/neighbor context slots."""
+windowed eviction, the write-once text/neighbor context slots, and the
+bit-exact neighbor K/V recompute option."""
 
 import types
 
@@ -14,6 +15,7 @@ from diffusers import WanTransformer3DModel
 from torch.nn.attention import SDPBackend, sdpa_kernel
 from torch.utils._pytree import tree_flatten, tree_unflatten
 
+import model_training.net.wan_transformer as wan_transformer_module
 import model_training.pipeline.wan_kv_cache_pipeline as wan_kv_module
 from model_training.net.rollout_kv_cache import RolloutKvCache
 from model_training.net.wan_transformer import ArtifixerTransformer
@@ -60,6 +62,7 @@ def _kv_cache_pipe(
     sink_size: int = 0,
     gradient_checkpointing: bool = False,
     truncate_rollout_gradients: bool = False,
+    recompute_neighbor_kv: bool = False,
     vae: torch.nn.Module | None = None,
 ) -> ArtifixerKvCachePipeline:
     torch.manual_seed(0)
@@ -76,6 +79,7 @@ def _kv_cache_pipe(
         expand_timesteps=False,
         attention_backend="native",
         truncate_rollout_gradients=truncate_rollout_gradients,
+        recompute_neighbor_kv=recompute_neighbor_kv,
     )
 
 
@@ -100,7 +104,14 @@ def _rollout_inputs(latent_frames: int, *, opacity_value: float | None = 1.0, wi
     )
 
 
-def _run_rollout(pipe, inputs: dict, num_inference_steps: int, *, condition: torch.Tensor | None = None):
+def _run_rollout(
+    pipe,
+    inputs: dict,
+    num_inference_steps: int,
+    *,
+    condition: torch.Tensor | None = None,
+    ignore_neighbors: bool = False,
+):
     torch.manual_seed(1234)
     return pipe.generate_samples_from_batch(
         inputs["condition"] if condition is None else condition,
@@ -114,6 +125,7 @@ def _run_rollout(pipe, inputs: dict, num_inference_steps: int, *, condition: tor
         inputs["encoded_prompt"],
         num_inference_steps,
         False,
+        ignore_neighbors=ignore_neighbors,
     )
 
 
@@ -282,6 +294,77 @@ def test_windowed_rollout_evicts_after_anchor_and_training_must_fit_the_window(m
     pipe.transformer.train()
     with torch.enable_grad(), pytest.raises(AssertionError, match="must not evict cached history"):
         _run_rollout(pipe, inputs, num_inference_steps=1)
+
+
+def _randomize_parameters(module: torch.nn.Module) -> None:
+    """Re-draw every parameter from a fixed seed. The neighbor value projection
+    and the opacity/camera embeddings are zero-initialized, so at init the
+    reference branch adds nothing and an equality check through it is vacuous."""
+    generator = torch.Generator().manual_seed(11)
+    with torch.no_grad():
+        for parameter in module.parameters():
+            parameter.copy_(0.2 * torch.randn(parameter.shape, generator=generator))
+
+
+def test_recompute_neighbor_kv_rollout_is_bit_identical_and_caches_no_reference_kv(monkeypatch):
+    """recompute_neighbor_kv trades the rollout-lifetime neighbor K/V slots for
+    a recompute on every pass. On a windowed eval rollout (eviction runs)
+    with three posed reference views: the output is bitwise equal to the
+    cached rollout's; the cached rollout holds every layer's reference K/V
+    and the recompute rollout holds none; and the added K/V projections run
+    once per layer per pass instead of once per layer per rollout.
+    Non-vacuity: ignoring the references changes the output."""
+    num_neighbors, num_chunks, num_steps = 3, 5, 2
+    inputs = _rollout_inputs(latent_frames=2 * num_chunks, opacity_value=None, with_neighbors=True)
+    inputs["neighbors_condition"] = torch.randn(1, 16, num_neighbors, _LATENT_HW, _LATENT_HW)
+    neighbor_w2cs = torch.eye(4).repeat(1, num_neighbors, 1, 1)
+    neighbor_w2cs[0, :, 0, 3] = torch.linspace(-0.5, 0.5, num_neighbors)
+    neighbor_w2cs[0, :, 2, 3] = 2.0
+    inputs["neighbor_w2cs"] = neighbor_w2cs
+    inputs["neighbor_Ks"] = torch.tensor([[1.0, 0.0, 0.5], [0.0, 1.0, 0.5], [0.0, 0.0, 1.0]]).repeat(
+        1, num_neighbors, 1, 1
+    )
+
+    captured = []
+    _spy_transformer_forwards(monkeypatch, captured)
+    projection_calls = []
+    original_projections = wan_transformer_module._get_added_kv_projections
+
+    def counting_projections(*args, **kwargs):
+        projection_calls.append(1)
+        return original_projections(*args, **kwargs)
+
+    monkeypatch.setattr(wan_transformer_module, "_get_added_kv_projections", counting_projections)
+
+    def rollout(recompute_neighbor_kv: bool, ignore_neighbors: bool = False):
+        captured.clear()
+        projection_calls.clear()
+        pipe = _kv_cache_pipe(local_attn_size=6, sink_size=2, recompute_neighbor_kv=recompute_neighbor_kv)
+        _randomize_parameters(pipe.transformer)
+        pipe.transformer.eval()
+        with torch.no_grad(), sdpa_kernel([SDPBackend.MATH]):
+            prediction = _run_rollout(pipe, inputs, num_steps, ignore_neighbors=ignore_neighbors)
+        cache = captured[-1]["kv_cache"]
+        neighbor_kv_bytes = sum(
+            tensor.numel() * tensor.element_size() for slot in cache._neighbor_kv if slot is not None for tensor in slot
+        )
+        return prediction, neighbor_kv_bytes, len(projection_calls), len(captured)
+
+    cached, cached_bytes, cached_projections, num_passes = rollout(recompute_neighbor_kv=False)
+    recomputed, recomputed_bytes, recomputed_projections, _ = rollout(recompute_neighbor_kv=True)
+    without_neighbors, *_ = rollout(recompute_neighbor_kv=False, ignore_neighbors=True)
+
+    num_layers = _REDUCED_WAN_CONFIG["num_layers"]
+    tokens_per_frame = (_LATENT_HW // 2) ** 2
+    inner_dim = _REDUCED_WAN_CONFIG["num_attention_heads"] * _REDUCED_WAN_CONFIG["attention_head_dim"]
+    assert num_passes == num_chunks * num_steps
+    assert torch.equal(recomputed, cached)
+    assert not torch.equal(without_neighbors, cached)
+    # fp32 K and V for every reference token on every layer, held for the whole rollout.
+    assert cached_bytes == num_layers * 2 * num_neighbors * tokens_per_frame * inner_dim * 4
+    assert recomputed_bytes == 0
+    assert cached_projections == num_layers
+    assert recomputed_projections == num_layers * num_passes
 
 
 # ---------------------------------------------------------------------------

@@ -69,6 +69,19 @@ def test_context_slots_store_detached_and_write_once(slot):
         store_kv(0, key, value)
 
 
+def test_recompute_neighbor_kv_cache_refuses_neighbor_stores():
+    """A recompute_neighbor_kv rollout keeps its neighbor slots empty: a store
+    is misuse, while the text slot keeps its write-once caching."""
+    cache = RolloutKvCache(1, truncate_rollout_gradients=False, recompute_neighbor_kv=True)
+    key = value = torch.zeros(1, 4, 8)
+
+    with pytest.raises(AssertionError, match="recompute_neighbor_kv"):
+        cache.store_neighbor_kv(0, key, value)
+    assert not cache.has_neighbor_kv(0)
+    cache.store_text_kv(0, key, value)
+    assert cache.has_text_kv(0)
+
+
 def test_wan_cp_local_cache_coordinates_stay_contiguous_on_every_rank():
     """Under CP each Wan rank caches only its own frame shard, so the
     transformer maps the shard's global start (chunk_start + rank *

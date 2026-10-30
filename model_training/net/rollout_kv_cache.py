@@ -18,7 +18,8 @@ class RolloutKvCache:
       store detached: neither family has a trainable parameter upstream of a
       cached context write (Cosmos3's text stream is its frozen reasoner; Wan
       fills these slots only on no-grad passes), so detaching changes neither
-      values nor gradients.
+      values nor gradients. ``recompute_neighbor_kv`` leaves the neighbor
+      slots empty for the whole rollout (see ``__init__``).
     * gen chunks: one (K, V) entry per FINISHED chunk of generated frames,
       appended in temporal order with a (start_frame, num_frames) record.
       Entries are never mutated, and reads slice ``[0, num_chunks)``
@@ -41,7 +42,7 @@ class RolloutKvCache:
     and conditioning are all rollout-specific).
     """
 
-    def __init__(self, num_layers: int, *, truncate_rollout_gradients: bool):
+    def __init__(self, num_layers: int, *, truncate_rollout_gradients: bool, recompute_neighbor_kv: bool = False):
         assert num_layers > 0, f"RolloutKvCache needs at least one layer, got {num_layers}"
         self.num_layers = int(num_layers)
         # Gen-chunk storage policy, one value per training run
@@ -54,6 +55,15 @@ class RolloutKvCache:
         # and a chunk's activations free after its own backward. Values are
         # identical either way; only gradients and memory differ.
         self.truncate_rollout_gradients = bool(truncate_rollout_gradients)
+        # Neighbor-slot policy, one value per rollout (--recompute_neighbor_kv).
+        # False: the first pass caches every layer's reference-view K/V and
+        # later passes read them back. True: the slots are never filled and
+        # every pass recomputes the reference K/V from the same reference
+        # latents and cameras. Values are identical either way (same
+        # operations on the same inputs); True frees num_layers x 2 x
+        # (references x tokens per frame) x hidden_dim elements for the whole
+        # rollout and pays the reference K/V projections on every pass.
+        self.recompute_neighbor_kv = bool(recompute_neighbor_kv)
         # Per layer: write-once context (K, V) slots.
         self._text_kv: list[tuple[torch.Tensor, torch.Tensor] | None] = [None] * self.num_layers
         self._neighbor_kv: list[tuple[torch.Tensor, torch.Tensor] | None] = [None] * self.num_layers
@@ -160,6 +170,10 @@ class RolloutKvCache:
         return self._neighbor_kv[layer_index] is not None
 
     def store_neighbor_kv(self, layer_index: int, k_neighbor: torch.Tensor, v_neighbor: torch.Tensor) -> None:
+        assert not self.recompute_neighbor_kv, (
+            f"layer {layer_index}: this rollout recomputes neighbor K/V on every pass "
+            "(recompute_neighbor_kv), so it never stores them"
+        )
         self._store_context_kv(self._neighbor_kv, "neighbor", layer_index, k_neighbor, v_neighbor)
 
     def read_neighbor_kv(self, layer_index: int) -> tuple[torch.Tensor, torch.Tensor]:
